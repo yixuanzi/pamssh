@@ -12,6 +12,13 @@
 - Admin tools: policy tester, connection test, SSH agent key picker, gateway host key scan, sessions, audit log
   viewer, known host keys, live server log, raw JSON editor.
 - CLI: `init` also creates an admin token; `token --admin [--rotate]`.
+- Admin UI "终端" (terminal) tab: pick a target, create or attach to a session, run commands with live streamed
+  output, history, Ctrl-C to interrupt, Ctrl-L to clear, and end the session. Commands go through the same policy
+  checks and audit log as agent commands (actor `admin-ui`).
+- Sessions record their origin (`agent`, `admin-ui`, `cli`); commands can be interrupted on request
+  (`interrupted: true` in results and the audit log); `onOutput` streams output while a command runs.
+- `audit.retentionDays` (default 30, 0 = keep forever): old audit entries are pruned at startup, every 6 hours and
+  when retention is shortened; the admin audit page can prune on demand.
 - Fix: `maxSessionsPerTarget` counted failed and disconnected sessions, which were never cleaned up, so a target
   could stay "full" with no live session. Now only sessions holding a login count; dead sessions are dropped after
   10 minutes; reviving one needs a free slot.

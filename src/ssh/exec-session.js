@@ -31,7 +31,14 @@ export class ExecSession extends EventEmitter {
     return job;
   }
 
-  _run(command, { timeoutMs = 120_000, maxOutputChars = 20_000 } = {}) {
+  /** Signal the running command. Returns false when nothing is running. */
+  interrupt() {
+    if (!this._current) return false;
+    this._current();
+    return true;
+  }
+
+  _run(command, { timeoutMs = 120_000, maxOutputChars = 20_000, onOutput } = {}) {
     const normalized = validateCommand(command);
     if (!this.alive) return Promise.reject(new Error('connection is closed'));
     const started = Date.now();
@@ -41,33 +48,37 @@ export class ExecSession extends EventEmitter {
           reject(new Error(`gateway refused exec request (${err.message}); try "mode": "shell" for this target`));
           return;
         }
-        const out = new OutputCollector(maxOutputChars);
-        const errOut = new OutputCollector(Math.max(2000, Math.floor(maxOutputChars / 4)));
+        const out = new OutputCollector(maxOutputChars, { onChunk: onOutput });
+        const errOut = new OutputCollector(Math.max(2000, Math.floor(maxOutputChars / 4)), { onChunk: onOutput });
         const outN = new TextNormalizer();
         const errN = new TextNormalizer();
         let exit = { code: null, signal: null };
         let timedOut = false;
-        const timer = setTimeout(() => {
-          timedOut = true;
-          this.logger?.warn(`exec timed out after ${timeoutMs}ms; signalling remote process`);
+        let interrupted = false;
+        const stop = (why) => {
+          this.logger?.warn(`exec ${why}; signalling remote process`);
           try { stream.signal('INT'); } catch { /* not all servers support signals */ }
           setTimeout(() => { try { stream.close(); } catch { /* ignore */ } }, 2000).unref();
-        }, timeoutMs);
+        };
+        const timer = setTimeout(() => { timedOut = true; stop(`timed out after ${timeoutMs}ms`); }, timeoutMs);
         timer.unref();
+        this._current = () => { interrupted = true; stop('interrupted on request'); };
 
         stream.on('data', (d) => out.push(outN.push(d)));
         stream.stderr.on('data', (d) => errOut.push(errN.push(d)));
         stream.on('exit', (code, signal) => { exit = { code: code ?? null, signal: signal ?? null }; });
         stream.on('close', () => {
           clearTimeout(timer);
+          this._current = null;
           resolve({
             output: out.finish(),
             stderr: errOut.finish(),
-            exitCode: exit.code ?? (timedOut ? 130 : null),
+            exitCode: exit.code ?? (timedOut || interrupted ? 130 : null),
             signal: exit.signal,
             cwd: null,
             durationMs: Date.now() - started,
             timedOut,
+            interrupted,
             truncated: out.truncated || errOut.truncated,
             sessionEnded: false,
           });

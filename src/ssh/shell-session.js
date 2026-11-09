@@ -342,21 +342,39 @@ export class ShellSession extends EventEmitter {
     return job;
   }
 
-  async _run(command, { timeoutMs = 120_000, maxOutputChars = 20_000 } = {}) {
+  /** Ctrl-C the running command (like the timeout path). Returns false when nothing is running. */
+  interrupt() {
+    if (!this._current) return false;
+    this._current.interrupt();
+    return true;
+  }
+
+  async _run(command, { timeoutMs = 120_000, maxOutputChars = 20_000, onOutput } = {}) {
     const normalized = validateCommand(command);
     if (!this.alive) throw new Error('shell session is closed');
     const seq = ++this.seq;
-    const collector = new OutputCollector(maxOutputChars);
+    const collector = new OutputCollector(maxOutputChars, { onChunk: onOutput });
     const started = Date.now();
     this.parser.expectCommand(seq, collector);
     const done = this._waitFor((ev) => ev.type === 'closed' || (ev.type === 'end' && ev.seq === seq));
+    let requestInterrupt;
+    const interruptRequested = new Promise((resolve) => { requestInterrupt = () => resolve('interrupt'); });
+    this._current = { seq, interrupt: requestInterrupt };
     this.stream.write(wrapCommand(this.nonce, seq, normalized));
 
-    let ev = await withTimeout(done, timeoutMs, null);
+    let ev;
     let timedOut = false;
-    if (ev === null) {
-      timedOut = true;
-      this.logger?.warn(`command #${seq} timed out after ${timeoutMs}ms; sending Ctrl-C`);
+    let interrupted = false;
+    try {
+      ev = await withTimeout(Promise.race([done, interruptRequested]), timeoutMs, null);
+    } finally {
+      this._current = null;
+    }
+    if (ev === null || ev === 'interrupt') {
+      if (ev === null) timedOut = true;
+      else interrupted = true;
+      this.logger?.warn(timedOut ? `command #${seq} timed out after ${timeoutMs}ms; sending Ctrl-C`
+        : `command #${seq} interrupted on request; sending Ctrl-C`);
       this.parser.drain();
       this.stream.write('\x03');
       await delay(300);
@@ -377,6 +395,7 @@ export class ShellSession extends EventEmitter {
       cwd: sessionEnded ? null : ev.cwd,
       durationMs: Date.now() - started,
       timedOut,
+      interrupted,
       truncated: collector.truncated,
       sessionEnded,
     };

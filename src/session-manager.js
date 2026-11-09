@@ -14,6 +14,8 @@ const SESSION_NAME_RE = /^[A-Za-z0-9._-]{1,32}$/;
 /** Failed / disconnected sessions stay listed (with their last error) this long, then are dropped. */
 const DEAD_SESSION_TTL_MS = 10 * 60_000;
 const MAX_LOST_KEYS = 500;
+/** How often background maintenance (audit retention) runs, besides once at startup. */
+export const MAINTENANCE_INTERVAL_MS = 6 * 60 * 60_000;
 
 /** Settings that only take effect when a session (re)connects. */
 function connectionKey(t) {
@@ -30,10 +32,12 @@ export class UserError extends Error {
 }
 
 class ManagedSession {
-  constructor(manager, target, name) {
+  constructor(manager, target, name, origin = 'agent') {
     this.manager = manager;
     this.target = target;
     this.name = name;
+    /** Who opened it: 'agent' (MCP), 'admin-ui' or 'cli'. */
+    this.origin = origin;
     this.key = `${target.id}#${name}`;
     this.state = 'new';
     this.createdAt = new Date();
@@ -174,6 +178,7 @@ class ManagedSession {
         ? this.connectedWith.login
         : `${this.target.username}@${this.target.pamServer.host}`,
       stale: this.stale,
+      origin: this.origin,
       /** Holds a PAM login and counts toward maxSessions. */
       active: this.holdsLogin,
       mode: this.target.mode,
@@ -230,6 +235,7 @@ export class SessionManager {
     this._selectors.clear();
     if (this._ownAudit && JSON.stringify(old.audit) !== JSON.stringify(config.audit)) {
       this.audit = new AuditLog(config.audit, { logger: this.logger });
+      if (this._maintenance) this.pruneAudit(); // a shorter retention or another file applies right away
     }
     if (this._ownHostKeys && JSON.stringify(old.hostKeys) !== JSON.stringify(config.hostKeys)) {
       this.hostKeys = new HostKeyStore(config.hostKeys.file, {
@@ -293,7 +299,7 @@ export class SessionManager {
       }));
   }
 
-  _session(targetId, name = 'default', { create = true } = {}) {
+  _session(targetId, name = 'default', { create = true, origin } = {}) {
     if (!SESSION_NAME_RE.test(name)) {
       throw new UserError('session name must match [A-Za-z0-9._-]{1,32}');
     }
@@ -317,7 +323,7 @@ export class SessionManager {
       }
     }
     if (!s) {
-      s = new ManagedSession(this, target, name);
+      s = new ManagedSession(this, target, name, origin);
       s.resumed = this._lost.delete(key);
       this.sessions.set(key, s);
     }
@@ -332,13 +338,24 @@ export class SessionManager {
     if (this._lost.size > MAX_LOST_KEYS) this._lost.delete(this._lost.keys().next().value);
   }
 
-  async openSession(targetId, name = 'default') {
-    const s = this._session(targetId, name);
+  async openSession(targetId, name = 'default', { origin } = {}) {
+    const s = this._session(targetId, name, { origin });
     await s.ensure();
     return s.status();
   }
 
-  async exec(targetId, command, { session = 'default', timeoutMs, actor } = {}) {
+  /** Ctrl-C the command running in a session. Returns false when nothing is running. */
+  interrupt(targetId, name = 'default') {
+    const s = this._session(targetId, name, { create: false });
+    if (!s || !s.inflight || !s.runner?.interrupt) return false;
+    return s.runner.interrupt();
+  }
+
+  /**
+   * Run a command in a session (created on first use). `onOutput` receives
+   * output as it arrives, before the final (possibly truncated) result.
+   */
+  async exec(targetId, command, { session = 'default', timeoutMs, actor, onOutput } = {}) {
     const target = this.target(targetId);
     const id = randomUUID();
     const base = {
@@ -349,12 +366,14 @@ export class SessionManager {
       this.audit.write({ ...base, event: 'denied', command, reason: verdict.reason });
       throw new UserError(`blocked by policy: ${verdict.reason}`);
     }
-    const s = this._session(target.id, session);
+    const origin = ['admin-ui', 'cli'].includes(actor?.client) ? actor.client : 'agent';
+    const s = this._session(target.id, session, { origin });
     this.audit.write({ ...base, event: 'exec', command });
     try {
       const result = await s.exec(command, {
         timeoutMs: Math.min(timeoutMs ?? target.commandTimeoutMs, 3_600_000),
         maxOutputChars: target.maxOutputChars,
+        onOutput,
       });
       this.audit.write({
         ...base,
@@ -362,6 +381,7 @@ export class SessionManager {
         exitCode: result.exitCode,
         durationMs: result.durationMs,
         timedOut: result.timedOut,
+        ...(result.interrupted ? { interrupted: true } : {}),
         outputChars: result.output.length,
         sessionEnded: result.sessionEnded,
       });
@@ -405,8 +425,29 @@ export class SessionManager {
     }
   }
 
+  /** Apply audit retention now (`audit.retentionDays`, 0 = keep forever). */
+  pruneAudit() {
+    return this.audit.prune(this.config.audit.retentionDays);
+  }
+
+  /**
+   * Long-running servers call this once: prunes the audit log now and then
+   * every 6 hours.
+   */
+  startMaintenance({ intervalMs = MAINTENANCE_INTERVAL_MS } = {}) {
+    if (this._maintenance) return;
+    const run = () => {
+      try { this.pruneAudit(); } catch (err) { this.logger.error(`maintenance failed: ${err.message}`); }
+    };
+    run();
+    this._maintenance = setInterval(run, intervalMs);
+    this._maintenance.unref();
+  }
+
   async closeAll() {
     clearInterval(this._reaper);
+    clearInterval(this._maintenance);
+    this._maintenance = null;
     for (const s of this.sessions.values()) s.close('server shutting down');
     this.sessions.clear();
   }

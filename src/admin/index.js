@@ -6,6 +6,7 @@ import { ENV_OVERRIDES, resolveTarget } from '../config.js';
 import { ConfigConflictError, ConfigValidationError } from '../config-store.js';
 import { listAgentIdentities } from '../agent.js';
 import { checkPolicy } from '../policy.js';
+import { UserError } from '../session-manager.js';
 import { scanHostKey } from '../ssh/scan.js';
 import { VERSION } from '../version.js';
 import { AdminAuth, sameOriginWrite } from './auth.js';
@@ -30,6 +31,11 @@ const SECURITY_HEADERS = {
 export const SECRET_MASK = '__PAMSSH_UNCHANGED__';
 const SECRET_PATHS = [['server', 'authToken'], ['server', 'adminToken']];
 const MAX_BODY = 2 * 1024 * 1024;
+/** Returned by a route that wrote its own (streaming) response. */
+const HANDLED = Symbol('handled');
+/** Live output sent to the browser per command; the final result is still capped by maxOutputChars. */
+const MAX_STREAM_CHARS = 1024 * 1024;
+const SESSION_RE = /^[A-Za-z0-9._-]{1,32}$/;
 
 class HttpError extends Error {
   constructor(status, message, extra = {}) {
@@ -418,6 +424,80 @@ export function createAdmin({ store, manager, logger, running, mcpSessions, star
       }
     },
 
+    'POST /api/audit/prune': () => {
+      const r = manager.pruneAudit();
+      return { ok: !r.error, retentionDays: getConfig().audit.retentionDays, ...r };
+    },
+
+    // ----- interactive shell (admin UI "Shell" tab) -----
+    'POST /api/shell/open': async (req) => {
+      const { target, session } = await readJson(req);
+      const name = String(session || '');
+      if (!SESSION_RE.test(name)) throw new HttpError(400, '会话名只能包含字母、数字、点、下划线和连字符，最长 32 个字符');
+      try {
+        const status = await manager.openSession(String(target), name, { origin: 'admin-ui' });
+        log.info(`admin opened shell session ${target}/${name}`);
+        return { ok: true, session: status };
+      } catch (err) {
+        throw new HttpError(err instanceof UserError ? 400 : 502, err.message);
+      }
+    },
+
+    'POST /api/shell/exec': async (req, ctx) => {
+      const { target, session, command, timeoutMs } = await readJson(req);
+      if (typeof command !== 'string' || !command.trim()) throw new HttpError(400, '命令不能为空');
+      if (!SESSION_RE.test(String(session || ''))) throw new HttpError(400, '会话名无效');
+      if (timeoutMs !== undefined && !(Number.isInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 3_600_000)) {
+        throw new HttpError(400, '超时必须是 1 ~ 3600000 毫秒的整数');
+      }
+      const { res } = ctx;
+      res.writeHead(200, {
+        ...SECURITY_HEADERS, 'content-type': 'application/x-ndjson; charset=utf-8', 'x-accel-buffering': 'no',
+      });
+      res.flushHeaders?.();
+      const write = (obj) => { if (!res.destroyed && !res.writableEnded) res.write(`${JSON.stringify(obj)}\n`); };
+      let buf = '';
+      let streamed = 0;
+      let capped = false;
+      let timer = null;
+      const flush = () => {
+        clearTimeout(timer);
+        timer = null;
+        if (buf) { write({ type: 'output', data: buf }); buf = ''; }
+      };
+      const onOutput = (text) => {
+        if (capped) return;
+        if (streamed + text.length > MAX_STREAM_CHARS) {
+          text = text.slice(0, MAX_STREAM_CHARS - streamed);
+          capped = true;
+        }
+        streamed += text.length;
+        buf += text;
+        if (capped) { flush(); write({ type: 'output-capped', limit: MAX_STREAM_CHARS }); } else if (buf.length > 64 * 1024) flush();
+        else if (!timer) timer = setTimeout(flush, 40);
+      };
+      write({ type: 'start', target, session, at: new Date().toISOString() });
+      try {
+        const r = await manager.exec(String(target), command, {
+          session: String(session), timeoutMs, onOutput, actor: { client: 'admin-ui', ip: req.socket.remoteAddress },
+        });
+        flush();
+        write({ type: 'result', ...r });
+      } catch (err) {
+        flush();
+        write({ type: 'error', message: err.message, policy: /^blocked by policy/.test(err.message) });
+      }
+      res.end();
+      return HANDLED;
+    },
+
+    'POST /api/shell/interrupt': async (req) => {
+      const { target, session } = await readJson(req);
+      const ok = manager.interrupt(String(target), String(session || 'default'));
+      if (ok) log.info(`admin interrupted the running command in ${target}/${session}`);
+      return { ok };
+    },
+
     'GET /api/logs': (req, ctx, url) => ({
       level: logger.level,
       entries: logger.recent({ limit: 500, afterSeq: Number(url.searchParams.get('after')) || 0 }),
@@ -454,7 +534,8 @@ export function createAdmin({ store, manager, logger, running, mcpSessions, star
       } else if (req.method === 'POST' && !sameOriginWrite(req)) {
         throw new HttpError(403, '请求来源校验失败');
       }
-      const out = await handler(req, { session }, url);
+      const out = await handler(req, { session, res }, url);
+      if (out === HANDLED) return true;
       if (out && out.body !== undefined && out.headers) send(res, 200, out.body, out.headers);
       else send(res, 200, out);
     } catch (err) {

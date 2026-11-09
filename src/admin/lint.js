@@ -28,6 +28,8 @@ export function lintConfig(cfg) {
   if (d.commandTimeoutMs > 30 * 60_000) info(['defaults', 'commandTimeoutMs'], '默认命令超时超过 30 分钟：失控的命令会长时间占用会话。');
 
   if (!cfg.audit.enabled) warn(['audit', 'enabled'], '审计日志已关闭：本地不会留下 agent 执行过的命令记录。');
+  if (cfg.audit.retentionDays === 0) info(['audit', 'retentionDays'], '审计记录永久保留，文件会一直增长。');
+  else if (cfg.audit.retentionDays < 7) info(['audit', 'retentionDays'], `只保留 ${cfg.audit.retentionDays} 天：出问题后可能来不及追溯。`);
   if (!cfg.policy.deny.length && !cfg.policy.allow.length) {
     info(['policy', 'deny'], '全局策略为空：没有任何命令护栏（目标上仍可单独配置）。');
   }

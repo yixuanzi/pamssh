@@ -39,7 +39,7 @@
   "scripts": {
     "start": "node bin/pamssh-mcp.js serve",
     "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
-    "test:unit": "node --test test/config.test.js test/policy.test.js test/shell-parser.test.js test/hostkeys.test.js test/admin.test.js",
+    "test:unit": "node --test test/config.test.js test/policy.test.js test/shell-parser.test.js test/hostkeys.test.js test/admin.test.js test/audit.test.js",
     "mock-pam": "node examples/mock-pam-server.js",
     "prepublishOnly": "npm test"
   },

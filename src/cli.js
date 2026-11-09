@@ -155,6 +155,7 @@ Next steps:
     const config = store.config;
     const logger = createLogger(values['log-level'] || config.logLevel || 'info');
     const manager = new SessionManager(config, { logger });
+    manager.startMaintenance(); // audit retention now and every 6 hours
     const port = values.port !== undefined ? Number(values.port) : undefined;
     const http = await startHttpServer({
       store, manager, logger, host: values.host, port, cliLogLevel: values['log-level'],
@@ -179,6 +180,7 @@ Next steps:
 
   async stdio(values) {
     const { logger, manager } = makeRuntime(values);
+    manager.startMaintenance();
     const srv = await startStdioServer({ manager, logger });
     const shutdown = onShutdown(async () => {
       await manager.closeAll();

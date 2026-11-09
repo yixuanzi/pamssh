@@ -374,3 +374,103 @@ test('idle logout is reported as RECONNECTED on the next command', { skip }, asy
     await m.closeAll();
   }
 });
+
+test('streamed output and manual interrupt (shell and exec modes)', { skip }, async () => {
+  const m = new SessionManager(makeConfig(), { logger: silentLogger });
+  try {
+    const chunks = [];
+    const started = Date.now();
+    let firstAt = null;
+    const r = await m.exec('web', 'for i in 1 2 3; do echo tick$i; sleep 0.3; done', {
+      onOutput: (t) => { firstAt ??= Date.now(); chunks.push(t); },
+    });
+    assert.equal(r.output, 'tick1\ntick2\ntick3\n');
+    assert.equal(chunks.join(''), r.output, 'streamed text matches the final output');
+    assert.ok(chunks.length >= 2, `output arrived in pieces (${chunks.length})`);
+    assert.ok(firstAt - started < Date.now() - started - 300, 'first output arrived before the command finished');
+
+    assert.equal(m.interrupt('web'), false, 'nothing running');
+    // keep `sleep` last: after Ctrl-C, bash 3.2 still runs the rest of the line, bash 5 does not
+    const running = m.exec('web', 'cd /tmp; echo start; sleep 30');
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(m.interrupt('web'), true);
+    const ir = await running;
+    assert.equal(ir.interrupted, true);
+    assert.equal(ir.timedOut, false);
+    assert.equal(ir.exitCode, 130);
+    assert.equal(ir.output, 'start\n');
+    assert.match((await m.exec('web', 'pwd')).output, /tmp/, 'session survives the interrupt');
+
+    const ex = m.exec('web-exec', 'echo e1; sleep 30');
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(m.interrupt('web-exec'), true);
+    const er = await ex;
+    assert.equal(er.interrupted, true);
+    assert.equal(er.output, 'e1\n');
+  } finally {
+    await m.closeAll();
+  }
+});
+
+test('admin shell API: open, streamed exec, interrupt, policy, close', { skip }, async () => {
+  const { ConfigStore } = await import('../src/config-store.js');
+  const file = path.join(dir, 'shell-config.json');
+  const ADMIN = 's'.repeat(24);
+  fs.writeFileSync(file, JSON.stringify({
+    server: { port: 0, authToken: TOKEN, adminToken: ADMIN },
+    agentSocket: agent.sock,
+    policy: { deny: ['^\\s*reboot\\b'] },
+    audit: { file: path.join(dir, 'audit-shell.jsonl') },
+    hostKeys: { file: path.join(dir, 'known-shell.json') },
+    pamServers: { mock: { host: '127.0.0.1', port: mock.port, user: 'alice', identity: { comment: 'PAM Key' } } },
+    targets: { web: { host: 'web-01', account: 'root' } },
+  }));
+  const store = ConfigStore.load(file);
+  const manager = new SessionManager(store.config, { logger: silentLogger });
+  const http = await startHttpServer({ store, manager, logger: silentLogger });
+  const url = (p) => `http://127.0.0.1:${http.port}/admin/api${p}`;
+  const headers = { authorization: `Bearer ${ADMIN}`, 'content-type': 'application/json' };
+  const post = (p, body) => fetch(url(p), { method: 'POST', headers, body: JSON.stringify(body) });
+  const events = async (res) => (await res.text()).trim().split('\n').map((l) => JSON.parse(l));
+  try {
+    const open = await (await post('/shell/open', { target: 'web', session: 'ui-1' })).json();
+    assert.equal(open.ok, true);
+    assert.equal(open.session.origin, 'admin-ui');
+    assert.equal((await post('/shell/open', { target: 'web', session: 'bad name' })).status, 400);
+
+    const res = await post('/shell/exec', { target: 'web', session: 'ui-1', command: 'cd /tmp; for i in 1 2; do echo n$i; sleep 0.2; done' });
+    assert.match(res.headers.get('content-type'), /ndjson/);
+    const evs = await events(res);
+    assert.equal(evs[0].type, 'start');
+    assert.ok(evs.filter((e) => e.type === 'output').length >= 1);
+    const result = evs.find((e) => e.type === 'result');
+    assert.equal(result.output, 'n1\nn2\n');
+    assert.match(result.cwd, /tmp/);
+
+    const pending = post('/shell/exec', { target: 'web', session: 'ui-1', command: 'sleep 30' });
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal((await (await post('/shell/interrupt', { target: 'web', session: 'ui-1' })).json()).ok, true);
+    const ir = (await events(await pending)).find((e) => e.type === 'result');
+    assert.equal(ir.interrupted, true);
+
+    const blocked = (await events(await post('/shell/exec', { target: 'web', session: 'ui-1', command: 'reboot' }))).at(-1);
+    assert.equal(blocked.type, 'error');
+    assert.equal(blocked.policy, true);
+
+    const audit = fs.readFileSync(path.join(dir, 'audit-shell.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    assert.ok(audit.some((e) => e.actor?.client === 'admin-ui' && e.interrupted));
+    assert.ok(audit.some((e) => e.event === 'denied' && e.command === 'reboot'));
+
+    const sessions = await (await fetch(url('/sessions'), { headers })).json();
+    assert.equal(sessions.sessions.find((s) => s.session === 'ui-1').origin, 'admin-ui');
+    assert.equal((await (await post('/sessions/close', { target: 'web', session: 'ui-1' })).json()).closed, true);
+    assert.equal(manager.listSessions().length, 0);
+
+    const pruned = await (await post('/audit/prune', {})).json();
+    assert.equal(pruned.retentionDays, 30);
+    assert.equal(pruned.removed, 0);
+  } finally {
+    await manager.closeAll();
+    await http.close();
+  }
+});

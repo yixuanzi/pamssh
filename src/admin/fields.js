@@ -110,6 +110,11 @@ export const AUDIT_FIELDS = [
     key: 'file', label: '审计文件路径', type: 'string', defaultText: '~/.config/pamssh-mcp/audit.jsonl',
     help: '审计日志位置，支持 `~` 和 `$HOME`。文件以 0600 权限创建。',
   },
+  {
+    key: 'retentionDays', label: '保留天数', type: 'int', default: 30, min: 0, max: 3650, unit: 'day',
+    help: '只保留最近多少天的审计记录，更早的记录会被删除。服务启动时清理一次，之后每 6 小时清理一次；在这里改小保存后也会立即清理。0 表示永久保留（文件会一直增长）。关闭审计日志后已有记录仍按此期限过期。',
+    warn: '清理是直接从文件中删除旧记录，不可恢复。需要长期留存时，先把审计文件归档到别处或调大天数。',
+  },
 ];
 
 export const HOSTKEY_FIELDS = [

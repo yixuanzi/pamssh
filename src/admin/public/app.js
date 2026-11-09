@@ -161,6 +161,7 @@ const TABS = [
   ['pams', 'PAM 服务器'],
   ['settings', '全局设置'],
   ['sessions', '会话'],
+  ['shell', '终端'],
   ['audit', '审计日志'],
   ['hostkeys', '主机指纹'],
   ['logs', '服务日志'],
@@ -181,7 +182,14 @@ function toast(text, kind = 'info', ms = 4500) {
 function modal({ title, body, actions = [], wide = false }) {
   return new Promise((resolve) => {
     const close = (v) => { back.remove(); document.removeEventListener('keydown', onKey); resolve(v); };
-    const onKey = (e) => { if (e.key === 'Escape') close(undefined); };
+    const onKey = (e) => {
+      if (e.key === 'Escape') close(undefined);
+      // Enter in a single-line field submits the dialog's primary action
+      if (e.key === 'Enter' && !e.isComposing && e.target.tagName === 'INPUT' && back.contains(e.target)) {
+        e.preventDefault();
+        back.querySelector('.modal-foot .btn.primary')?.click();
+      }
+    };
     const foot = h('div', { class: 'modal-foot' },
       actions.map((a) => h('button', {
         class: `btn ${a.kind || ''}`, text: a.label, type: 'button',
@@ -396,7 +404,7 @@ function render() {
   stopTimers();
   writeHash();
   renderNav();
-  const pages = { overview, targets, pams, settings, sessions, audit, hostkeys, logs, json, backups };
+  const pages = { overview, targets, pams, settings, sessions, shell, audit, hostkeys, logs, json, backups };
   const y = window.scrollY;
   put(mainEl);
   if (S.restartNotice.length) {
@@ -629,6 +637,7 @@ function fmtVal(v, f) {
   if (typeof v === 'boolean') return v ? '是' : '否';
   if (f?.unit === 'ms') return `${v}（${humanMs(v)}）`;
   if (f?.unit === 'min') return `${v}（${humanMin(v)}）`;
+  if (f?.unit === 'day') return v === 0 ? '0（永久保留）' : `${v} 天`;
   return String(v);
 }
 
@@ -703,7 +712,12 @@ function renderControl(f, path, value, hints, ctx) {
     case 'int':
     case 'number': {
       const human = h('span', { class: 'human' });
-      const upd = (v) => { human.textContent = v === undefined ? '' : f.unit === 'ms' ? `= ${humanMs(v)}` : f.unit === 'min' ? `= ${humanMin(v)}` : ''; };
+      const upd = (v) => {
+        human.textContent = v === undefined ? ''
+          : f.unit === 'ms' ? `= ${humanMs(v)}`
+            : f.unit === 'min' ? `= ${humanMin(v)}`
+              : f.unit === 'day' ? (v === 0 ? '= 永久保留' : `= ${v} 天`) : '';
+      };
       upd(value);
       hints.append(human);
       return h('input', {
@@ -1268,7 +1282,7 @@ function sessions() {
     if (!r.sessions.length) { put(body, h('div', { class: 'empty', text: '当前没有 SSH 会话。agent 第一次调用 pam_exec 时会自动登录。' })); return; }
     const stateBadge = (s) => ({ ready: h('span', { class: 'badge ok', text: '已连接' }), connecting: h('span', { class: 'badge', text: '连接中' }), error: h('span', { class: 'badge err', text: '错误' }), disconnected: h('span', { class: 'badge', text: '已断开' }), new: h('span', { class: 'badge', text: '未连接' }) }[s.state] || h('span', { class: 'badge', text: s.state }));
     put(body, h('div', { class: 'table-wrap' }, h('table', {},
-      h('thead', {}, h('tr', {}, ['目标 / 会话', '状态', '登录串', '当前目录', '命令数', '最后活动', '空闲超时', ''].map((t) => h('th', { text: t })))),
+      h('thead', {}, h('tr', {}, ['目标 / 会话', '状态', '来源', '登录串', '当前目录', '命令数', '最后活动', '空闲超时', ''].map((t) => h('th', { text: t })))),
       h('tbody', {}, r.sessions.map((s) => {
         const idleLeft = s.idleTimeoutMinutes > 0 && s.state === 'ready'
           ? Math.max(0, Math.round(s.idleTimeoutMinutes - (Date.now() - new Date(s.lastUsedAt).getTime()) / 60000)) : null;
@@ -1276,12 +1290,16 @@ function sessions() {
           h('td', {}, h('button', { class: 'linkish', type: 'button', text: s.target, onclick: () => go('targets', s.target) }), ` / ${s.session}`),
           h('td', {}, stateBadge(s), s.busy ? h('span', { class: 'badge', text: '执行中' }) : null, s.stale ? h('span', { class: 'badge stale', text: '使用旧配置', title: '连接参数已在配置中修改，关闭后按新配置重连' }) : null,
             s.lastError ? h('div', { class: 'msg error', style: 'margin-top:4px', text: s.lastError }) : null),
+          h('td', { text: ORIGIN_LABEL[s.origin] || s.origin || '—', title: s.active ? '占用会话名额' : '不占用名额（失败或已断开）' }),
           h('td', { class: 'mono', text: s.login }),
           h('td', { class: 'mono', text: s.cwd ?? '—' }),
           h('td', { text: s.commands }),
           h('td', { text: ago(s.lastUsedAt), title: fmtTime(s.lastUsedAt) }),
           h('td', { text: s.idleTimeoutMinutes === 0 ? '永不' : idleLeft === null ? `${s.idleTimeoutMinutes} 分钟` : `约 ${idleLeft} 分钟后` }),
-          h('td', {}, h('button', {
+          h('td', {}, h('div', { class: 'btn-row' }, h('button', {
+            class: 'btn small', type: 'button', text: '打开终端',
+            onclick: () => { S.term.target = s.target; S.term.session = s.session; go('shell'); termOpen(s.target, s.session); },
+          }), h('button', {
             class: 'btn small danger', type: 'button', text: '关闭',
             onclick: async () => {
               if (!(await confirmBox('关闭会话', `关闭 ${s.target}/${s.session}？正在执行的命令会被中断，cwd 和环境变量会丢失；agent 下次调用会自动重新登录。`, '关闭', 'danger'))) return;
@@ -1289,7 +1307,7 @@ function sessions() {
               toast('已关闭', 'ok');
               load();
             },
-          })));
+          }))));
       })))));
   };
   load();
@@ -1308,7 +1326,8 @@ function audit() {
     const qs = new URLSearchParams({ limit: limit.value, target: targetSel.value, event: eventSel.value, q: q.value });
     let r;
     try { r = await api('GET', `/audit?${qs}`); } catch (e) { put(body, h('div', { class: 'msg error', text: e.message })); return; }
-    put(info, rich(`文件：\`${r.file}\`${r.enabled ? '' : '（审计已关闭，不会写入新记录）'}。不记录命令输出。`));
+    const days = S.saved.audit?.retentionDays ?? 30;
+    put(info, rich(`文件：\`${r.file}\`${r.enabled ? '' : '（审计已关闭，不会写入新记录）'}。不记录命令输出。${days === 0 ? '记录永久保留。' : `保留最近 ${days} 天，服务启动时和每 6 小时自动清理更早的记录。`}`));
     if (!r.entries.length) { put(body, h('div', { class: 'empty', text: '没有记录' })); return; }
     const ev = { exec: ['执行', 'badge'], result: ['结果', 'badge ok'], denied: ['拒绝', 'badge err'], error: ['错误', 'badge err'] };
     put(body, h('div', { class: 'table-wrap' }, h('table', {},
@@ -1318,16 +1337,30 @@ function audit() {
         h('td', {}, h('span', { class: (ev[e.event] || ['', 'badge'])[1], text: (ev[e.event] || [e.event])[0] })),
         h('td', { text: `${e.target}/${e.session}` }),
         h('td', { class: 'mono' }, e.command ?? (e.event === 'result'
-          ? `exit=${e.exitCode} · ${e.durationMs}ms · ${e.outputChars} 字符${e.timedOut ? ' · 超时' : ''}${e.sessionEnded ? ' · 会话结束' : ''}` : ''),
+          ? `exit=${e.exitCode} · ${e.durationMs}ms · ${e.outputChars} 字符${e.timedOut ? ' · 超时' : ''}${e.interrupted ? ' · 手动中断' : ''}${e.sessionEnded ? ' · 会话结束' : ''}` : ''),
         e.reason ? h('div', { style: 'color:var(--danger)', text: e.reason }) : null,
         e.error ? h('div', { style: 'color:var(--danger)', text: e.error }) : null),
-        h('td', { text: [e.actor?.client, e.actor?.mcpSession?.slice(0, 8)].filter(Boolean).join(' · ') || '—' })))))));
+        h('td', { text: [e.actor?.client === 'admin-ui' ? '管理页面' : e.actor?.client, e.actor?.mcpSession?.slice(0, 8)].filter(Boolean).join(' · ') || '—' })))))));
   };
   for (const el of [targetSel, eventSel, limit]) el.addEventListener('change', load);
   let qt;
   q.addEventListener('input', () => { clearTimeout(qt); qt = setTimeout(load, 300); });
   mainEl.append(pageHead('审计日志', 'agent 请求执行的每条命令（最新在前）。'),
-    card(null, h('div', {}, info, h('div', { class: 'filters' }, targetSel, eventSel, q, limit, h('button', { class: 'btn small', type: 'button', text: '刷新', onclick: load })), body)));
+    card(null, h('div', {}, info, h('div', { class: 'filters' }, targetSel, eventSel, q, limit,
+      h('button', { class: 'btn small', type: 'button', text: '刷新', onclick: load }),
+      h('button', {
+        class: 'btn small', type: 'button', text: '立即清理过期记录',
+        onclick: async () => {
+          const days = S.saved.audit?.retentionDays ?? 30;
+          if (days === 0) { toast('保留天数为 0（永久保留），不会清理', 'warn'); return; }
+          if (!(await confirmBox('清理审计记录', `删除 ${days} 天以前的审计记录？删除后无法恢复。`, '清理', 'danger'))) return;
+          try {
+            const r = await api('POST', '/audit/prune');
+            toast(r.removed ? `已删除 ${r.removed} 条过期记录，保留 ${r.kept} 条` : '没有过期记录', 'ok');
+            load();
+          } catch (err) { toast(err.message, 'error'); }
+        },
+      })), body)));
   load();
 }
 
@@ -1511,6 +1544,400 @@ function backups() {
       },
     })), { help: '手工编辑了配置文件后，用它让运行中的服务应用新配置（无需重启）。文件有错误时不会应用，并显示错误。' }));
   load();
+}
+
+// ---------- shell (terminal-like command runner) ----------
+const ORIGIN_LABEL = { agent: 'agent', 'admin-ui': '管理页面', cli: 'CLI' };
+const TERM_MAX_CHARS = 2 * 1024 * 1024;
+S.term = {
+  target: null,
+  session: null,
+  screens: {},
+  history: store.get('shellHistory', []),
+  timeoutMs: '',
+  sessionsCache: [],
+};
+const termKey = (t, s) => `${t}#${s}`;
+function screenOf(key) {
+  if (!S.term.screens[key]) S.term.screens[key] = { entries: [], cwd: null, running: null, ended: false, chars: 0 };
+  return S.term.screens[key];
+}
+function collapseCR(text) {
+  if (!text.includes('\r')) return text;
+  return text.split('\n').map((line) => {
+    if (!line.includes('\r')) return line;
+    const parts = line.split('\r');
+    for (let i = parts.length - 1; i >= 0; i--) if (parts[i] !== '') return parts[i];
+    return '';
+  }).join('\n');
+}
+function termPrompt(target, cwd) {
+  const acct = S.saved.targets?.[target]?.account ?? '?';
+  return `${acct}@${target}:${cwd || '~'}$ `;
+}
+function termPush(key, entry) {
+  const sc = screenOf(key);
+  sc.entries.push(entry);
+  sc.chars += (entry.text || '').length;
+  while (sc.chars > TERM_MAX_CHARS && sc.entries.length > 1) sc.chars -= (sc.entries.shift().text || '').length;
+  const out = document.getElementById('term-out');
+  if (out && out.dataset.key === key) {
+    out.append(termEntryEl(entry));
+    out.scrollTop = out.scrollHeight;
+  }
+  return entry;
+}
+/** Output as a terminal shows it: \r overwrites, and the final newline does not add an empty line. */
+const entryText = (e) => (e.kind === 'out' ? collapseCR(e.text).replace(/\n$/, '') : e.text);
+function termEntryEl(e) {
+  if (e.kind === 'cmd') {
+    const el = h('div', { class: 't-cmd' }, h('span', { class: 't-prompt', text: e.prompt }), h('span', { class: 't-cmdtext', text: e.text }));
+    e.el = el;
+    return el;
+  }
+  const el = h('div', { class: e.cls || '', text: entryText(e) });
+  e.el = el;
+  return el;
+}
+function termUpdate(key, entry) {
+  const out = document.getElementById('term-out');
+  if (entry.el && out && out.dataset.key === key) {
+    entry.el.textContent = entryText(entry);
+    out.scrollTop = out.scrollHeight;
+  }
+}
+function addHistory(cmd) {
+  const hist = S.term.history.filter((x) => x !== cmd);
+  hist.push(cmd);
+  S.term.history = hist.slice(-200);
+  store.set('shellHistory', S.term.history);
+}
+
+async function termLoadSessions() {
+  try {
+    S.term.sessionsCache = (await api('GET', '/sessions')).sessions;
+  } catch { /* shown elsewhere */ }
+  return S.term.sessionsCache;
+}
+
+async function termOpen(target, name) {
+  const key = termKey(target, name);
+  const sc = screenOf(key);
+  S.term.target = target;
+  S.term.session = name;
+  sc.ended = false;
+  const note = termPush(key, { kind: 'meta', cls: 't-meta', text: `正在打开会话 ${target}/${name}…（新登录可能弹出 1Password 授权，请批准）` });
+  render();
+  try {
+    const r = await api('POST', '/shell/open', { target, session: name });
+    note.text = `已连接 ${r.session.login}${r.session.hostKey ? `（网关指纹 ${r.session.hostKey}）` : ''}`;
+    termUpdate(key, note);
+    if (r.session.cwd) sc.cwd = r.session.cwd;
+    if (r.session.origin === 'agent') {
+      termPush(key, { kind: 'meta', cls: 't-warn', text: '注意：这个会话是 agent 打开的，在这里执行的 cd / export 等会改变 agent 看到的状态。' });
+    }
+    if (!sc.cwd) await termRun(target, name, 'pwd', { silent: true });
+  } catch (e) {
+    note.text = `打开失败：${e.message}`;
+    note.cls = 't-err';
+    if (note.el) note.el.className = 't-err';
+    termUpdate(key, note);
+    sc.ended = true;
+  }
+  await termLoadSessions();
+  render();
+}
+
+/** Run one command and stream its output into the screen. */
+async function termRun(target, name, command, { silent = false } = {}) {
+  const key = termKey(target, name);
+  const sc = screenOf(key);
+  if (sc.running) return;
+  const controller = new AbortController();
+  sc.running = { command, started: Date.now(), controller, silent };
+  if (!silent) termPush(key, { kind: 'cmd', prompt: termPrompt(target, sc.cwd), text: command });
+  const out = silent ? { text: '' } : termPush(key, { kind: 'out', text: '' });
+  renderTermControls();
+  let result = null;
+  let failure = null;
+  try {
+    const res = await fetch('/admin/api/shell/exec', {
+      method: 'POST',
+      credentials: 'same-origin',
+      signal: controller.signal,
+      headers: { 'content-type': 'application/json', 'x-pamssh-admin': '1' },
+      body: JSON.stringify({ target, session: name, command, timeoutMs: S.term.timeoutMs ? Number(S.term.timeoutMs) : undefined }),
+    });
+    if (res.status === 401) { showLogin('登录已过期，请重新登录'); throw new Error('未登录'); }
+    if (!res.ok) {
+      let j = null;
+      try { j = await res.json(); } catch { /* not json */ }
+      throw new Error(j?.error || `${res.status} ${res.statusText}`);
+    }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let pending = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      pending += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = pending.indexOf('\n')) >= 0) {
+        const line = pending.slice(0, nl);
+        pending = pending.slice(nl + 1);
+        if (!line) continue;
+        const ev = JSON.parse(line);
+        if (ev.type === 'output' && !silent) { out.text += ev.data; termUpdate(key, out); }
+        else if (ev.type === 'output-capped' && !silent) termPush(key, { kind: 'meta', cls: 't-warn', text: `…实时输出超过 ${ev.limit} 字符，后续只显示最终结果` });
+        else if (ev.type === 'result') result = ev;
+        else if (ev.type === 'error') failure = ev;
+      }
+    }
+  } catch (e) {
+    failure = { message: e.name === 'AbortError' ? '已取消' : e.message };
+  } finally {
+    sc.running = null;
+  }
+  if (result) {
+    if (result.cwd) sc.cwd = result.cwd;
+    if (!silent) {
+      out.text = result.output; // final output: truncated and cleaned the same way agents see it
+      if (!out.text) { out.el?.remove(); sc.entries.splice(sc.entries.indexOf(out), 1); } else termUpdate(key, out);
+      const meta = [];
+      if (result.reconnected) meta.push(['t-warn', '会话已重新登录：之前的当前目录和环境变量已丢失']);
+      if (result.interrupted) meta.push(['t-warn', `^C 已中断（exit ${result.exitCode}）`]);
+      else if (result.timedOut) meta.push(['t-warn', `超时，已发送 Ctrl-C（exit ${result.exitCode}）`]);
+      else if (result.exitCode !== 0 && result.exitCode !== null) meta.push(['t-err', `exit ${result.exitCode}`]);
+      if (result.truncated) meta.push(['t-meta', '输出过长，中间部分已截断（与 agent 看到的一致）']);
+      if (result.durationMs >= 3000) meta.push(['t-meta', `耗时 ${humanMs(result.durationMs)}`]);
+      if (result.stderr) termPush(key, { kind: 'out', text: result.stderr, cls: 't-err' });
+      for (const [cls, text] of meta) termPush(key, { kind: 'meta', cls, text });
+    }
+    if (result.sessionEnded) {
+      sc.ended = true;
+      termPush(key, { kind: 'meta', cls: 't-warn', text: '会话已结束（远端 shell 已退出）。再次执行命令会重新登录。' });
+    }
+  } else if (failure) {
+    if (!silent && !out.text) { out.el?.remove(); sc.entries.splice(sc.entries.indexOf(out), 1); }
+    termPush(key, { kind: 'meta', cls: 't-err', text: failure.policy ? `被策略拒绝：${failure.message.replace(/^blocked by policy: /, '')}（可在“目标”页修改策略）` : `错误：${failure.message}` });
+  }
+  renderTermControls();
+}
+
+async function termInterrupt() {
+  const { target, session } = S.term;
+  if (!target || !session) return;
+  try {
+    const r = await api('POST', '/shell/interrupt', { target, session });
+    if (!r.ok) toast('当前没有正在运行的命令', 'warn', 2500);
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+}
+
+async function termEndSession() {
+  const { target, session } = S.term;
+  if (!target || !session) return;
+  const sc = screenOf(termKey(target, session));
+  const busy = sc.running ? '正在运行的命令会被中断，' : '';
+  if (!(await confirmBox('结束会话', `结束 ${target}/${session}？${busy}远端 shell 会退出，PAM 登录被释放。`, '结束会话', 'danger'))) return;
+  try {
+    await api('POST', '/sessions/close', { target, session });
+    sc.ended = true;
+    sc.cwd = null;
+    termPush(termKey(target, session), { kind: 'meta', cls: 't-warn', text: '会话已结束（手动）。' });
+    toast('会话已结束', 'ok');
+  } catch (e) {
+    toast(e.message, 'error');
+  }
+  await termLoadSessions();
+  render();
+}
+
+let termControlsEl = null;
+document.addEventListener('keydown', (e) => {
+  if (S.tab !== 'shell' || !e.ctrlKey || (e.key !== 'c' && e.key !== 'C')) return;
+  const { target, session } = S.term;
+  const sc = target && session ? S.term.screens[termKey(target, session)] : null;
+  if (!sc?.running || sc.running.silent || window.getSelection()?.toString()) return;
+  e.preventDefault();
+  termInterrupt();
+});
+function renderTermControls() {
+  if (!termControlsEl || !document.body.contains(termControlsEl)) return;
+  const { target, session } = S.term;
+  const sc = target && session ? screenOf(termKey(target, session)) : null;
+  if (!sc) { put(termControlsEl); return; }
+  if (sc.running && !sc.running.silent) {
+    const secs = () => Math.round((Date.now() - sc.running.started) / 1000);
+    const label = h('span', { text: `运行中 ${secs()} 秒` });
+    put(termControlsEl, h('div', { class: 'term-run' },
+      h('span', { class: 'spin' }), label,
+      h('button', { class: 'btn small', type: 'button', text: '中断 (Ctrl-C)', onclick: termInterrupt }),
+      h('span', { style: 'color:var(--t-dim)', text: '命令运行期间按 Ctrl-C 也可中断' })));
+    const t = setInterval(() => { if (!sc.running) clearInterval(t); else label.textContent = `运行中 ${secs()} 秒`; }, 1000);
+    S.timers.push(t);
+    return;
+  }
+  const prompt = h('span', { class: 't-prompt', text: termPrompt(target, sc.cwd) });
+  const ta = h('textarea', { rows: 1, spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', 'aria-label': '命令输入' });
+  let histIdx = S.term.history.length;
+  let draft = '';
+  const grow = () => { ta.style.height = 'auto'; ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`; };
+  ta.addEventListener('input', grow);
+  ta.addEventListener('keydown', (e) => {
+    const before = ta.value.slice(0, ta.selectionStart);
+    const after = ta.value.slice(ta.selectionEnd);
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      const cmd = ta.value.replace(/\s+$/, '');
+      if (!cmd.trim()) { termPush(termKey(target, session), { kind: 'cmd', prompt: termPrompt(target, sc.cwd), text: '' }); return; }
+      addHistory(cmd);
+      if (cmd.trim() === 'clear') { termClear(); return; }
+      termRun(target, session, cmd).then(() => document.querySelector('.term-in textarea')?.focus());
+    } else if (e.key === 'ArrowUp' && !before.includes('\n') && S.term.history.length) {
+      e.preventDefault();
+      if (histIdx === S.term.history.length) draft = ta.value;
+      histIdx = Math.max(0, histIdx - 1);
+      ta.value = S.term.history[histIdx];
+      grow();
+    } else if (e.key === 'ArrowDown' && !after.includes('\n') && histIdx < S.term.history.length) {
+      e.preventDefault();
+      histIdx += 1;
+      ta.value = histIdx === S.term.history.length ? draft : S.term.history[histIdx];
+      grow();
+    } else if (e.ctrlKey && (e.key === 'c' || e.key === 'C') && ta.selectionStart === ta.selectionEnd) {
+      e.preventDefault();
+      termPush(termKey(target, session), { kind: 'cmd', prompt: termPrompt(target, sc.cwd), text: `${ta.value}^C` });
+      ta.value = '';
+      grow();
+    } else if (e.ctrlKey && (e.key === 'l' || e.key === 'L')) {
+      e.preventDefault();
+      termClear();
+    }
+  });
+  put(termControlsEl, h('div', { class: 'term-in' }, prompt, ta));
+  requestAnimationFrame(() => ta.focus({ preventScroll: true }));
+}
+function termClear() {
+  const { target, session } = S.term;
+  const sc = screenOf(termKey(target, session));
+  sc.entries = [];
+  sc.chars = 0;
+  const out = document.getElementById('term-out');
+  if (out) put(out);
+}
+
+function shell() {
+  const targetIds = Object.keys(S.saved.targets || {});
+  if (S.term.target && !targetIds.includes(S.term.target)) { S.term.target = null; S.term.session = null; }
+  const targetSel = h('select', { 'aria-label': '目标' },
+    h('option', { value: '', text: targetIds.length ? '选择目标…' : '（没有目标）' }),
+    targetIds.map((t) => h('option', { value: t, text: `${t}（${S.saved.targets[t].account}@${S.saved.targets[t].host}）`, selected: t === S.term.target })));
+  const sessionSel = h('select', { 'aria-label': '会话' });
+  const fillSessions = () => {
+    const t = targetSel.value;
+    const list = S.term.sessionsCache.filter((x) => x.target === t);
+    put(sessionSel,
+      h('option', { value: '__new__', text: '＋ 新建会话…' }),
+      list.map((x) => h('option', {
+        value: x.session,
+        selected: x.session === S.term.session && t === S.term.target,
+        text: `${x.session} · ${({ ready: '已连接', connecting: '连接中', error: '失败', disconnected: '已断开', new: '未连接' })[x.state] || x.state} · ${ORIGIN_LABEL[x.origin] || x.origin}${x.busy ? ' · 执行中' : ''}`,
+      })));
+    if (!list.some((x) => x.session === S.term.session && t === S.term.target)) {
+      sessionSel.value = list.find((x) => x.origin === 'admin-ui')?.session ?? '__new__';
+    }
+  };
+  targetSel.addEventListener('change', fillSessions);
+  const openBtn = h('button', {
+    class: 'btn primary', type: 'button', text: '打开',
+    onclick: async () => {
+      const t = targetSel.value;
+      if (!t) { toast('先选择目标', 'warn'); return; }
+      let name = sessionSel.value;
+      if (name === '__new__') {
+        const used = S.term.sessionsCache.filter((x) => x.target === t).map((x) => x.session);
+        let n = 1;
+        while (used.includes(`ui-${n}`)) n++;
+        name = await promptSessionName(`ui-${n}`, used);
+        if (!name) return;
+      }
+      termOpen(t, name);
+    },
+  });
+  const timeoutSel = h('select', { 'aria-label': '命令超时', onchange: (e) => { S.term.timeoutMs = e.target.value; } },
+    [['', '超时：目标默认'], ['30000', '超时：30 秒'], ['120000', '超时：2 分钟'], ['600000', '超时：10 分钟'], ['1800000', '超时：30 分钟'], ['3600000', '超时：60 分钟']]
+      .map(([v, t]) => h('option', { value: v, text: t, selected: S.term.timeoutMs === v })));
+
+  const { target, session } = S.term;
+  const key = target && session ? termKey(target, session) : null;
+  const sc = key ? screenOf(key) : null;
+  const info = h('div', { class: 'term-info' });
+  if (key) {
+    const st = S.term.sessionsCache.find((x) => x.target === target && x.session === session);
+    info.append(
+      h('span', {}, '当前：', h('span', { class: 'mono', text: `${target}/${session}` })),
+      st ? h('span', {}, '状态：', h('span', { class: 'mono', text: st.state })) : h('span', { text: '状态：未打开' }),
+      st?.login ? h('span', {}, '登录：', h('span', { class: 'mono', text: st.login })) : null,
+      st ? h('span', {}, '来源：', ORIGIN_LABEL[st.origin] || st.origin) : null,
+      sc.cwd ? h('span', {}, '目录：', h('span', { class: 'mono', text: sc.cwd })) : null,
+    );
+  }
+  const toolbar = card(null, h('div', {},
+    h('div', { class: 'term-bar' }, targetSel, sessionSel, openBtn, timeoutSel,
+      h('span', { class: 'grow', style: 'flex:1' }),
+      key ? h('button', { class: 'btn small', type: 'button', text: '清屏 (Ctrl-L)', onclick: termClear }) : null,
+      key ? h('button', { class: 'btn small danger', type: 'button', text: '结束会话', onclick: termEndSession }) : null),
+    info));
+
+  const outEl = h('div', { class: 'term-out', id: 'term-out', 'data-key': key || '' });
+  if (sc) {
+    outEl.append(h('div', { class: 't-banner', text: `${target}/${session} · 每条命令都经过命令策略检查并记入审计 · stdin 为 /dev/null，不支持 vim、top、less 等交互程序` }));
+    for (const e of sc.entries) outEl.append(termEntryEl(e));
+  } else {
+    outEl.append(h('div', { class: 'term-empty' },
+      targetIds.length ? '选择目标和会话后点“打开”。会话可以是新建的（独立 PAM 登录），也可以是已有的（例如 agent 正在用的 default）。' : '还没有目标，先在“目标”页添加。'));
+  }
+  outEl.addEventListener('mouseup', () => {
+    if (!window.getSelection()?.toString()) document.querySelector('.term-in textarea')?.focus({ preventScroll: true });
+  });
+  termControlsEl = h('div', {});
+  const termEl = h('div', { class: 'term' }, outEl, termControlsEl);
+
+  mainEl.append(
+    pageHead('终端', '以终端方式在目标上执行命令：选择目标，新建或接入一个会话，逐条执行并实时查看输出。命令在会话里按顺序执行，cd 和环境变量会保留。'),
+    toolbar, termEl,
+    h('div', { class: 'help', style: 'margin-top:8px' }, rich('`Enter` 执行 · `Shift+Enter` 换行 · `↑`/`↓` 历史命令 · `Ctrl-C` 中断正在运行的命令 · `Ctrl-L` 清屏。输出过长时会和 agent 看到的一样截断中间部分；需要完整内容时用 grep / head / tail 过滤。')));
+  termLoadSessions().then(() => { fillSessions(); });
+  fillSessions();
+  renderTermControls();
+  requestAnimationFrame(() => { outEl.scrollTop = outEl.scrollHeight; });
+}
+
+async function promptSessionName(initial, used) {
+  const re = /^[A-Za-z0-9._-]{1,32}$/;
+  const input = h('input', { type: 'text', value: initial, spellcheck: 'false' });
+  const err = h('div', { class: 'fissues' });
+  let value = null;
+  const ok = await modal({
+    title: '新建会话',
+    body: h('div', {},
+      h('div', { class: 'help', style: 'margin:0 0 8px' }, rich('每个会话是一次独立的 PAM 登录（可能弹出 1Password 授权），计入目标的会话上限。会话名只能包含字母、数字、点、下划线和连字符。')),
+      input, err),
+    actions: [{ label: '取消', value: false }, {
+      label: '创建并登录', kind: 'primary', value: true,
+      onClick: () => {
+        const v = input.value.trim();
+        put(err);
+        if (!re.test(v)) { err.append(h('div', { class: 'msg error', text: '名称无效' })); return false; }
+        if (used.includes(v)) { err.append(h('div', { class: 'msg error', text: '已存在同名会话，请在会话列表中直接选择它' })); return false; }
+        value = v;
+        return true;
+      },
+    }],
+  });
+  return ok ? value : null;
 }
 
 boot();

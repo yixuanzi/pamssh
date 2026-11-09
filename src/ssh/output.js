@@ -31,7 +31,9 @@ export class TextNormalizer {
  * allowed size and records how much was dropped in between.
  */
 export class OutputCollector {
-  constructor(limit) {
+  /** @param {(text: string) => void} [onChunk] receives each piece of output as it arrives (ANSI stripped) */
+  constructor(limit, { onChunk } = {}) {
+    this.onChunk = onChunk;
     this.limit = Math.max(1000, limit);
     this.headLimit = Math.floor(this.limit * 0.3);
     this.tailLimit = this.limit - this.headLimit;
@@ -43,6 +45,9 @@ export class OutputCollector {
 
   push(s) {
     if (!s) return;
+    if (this.onChunk) {
+      try { this.onChunk(stripAnsi(s)); } catch { /* a listener must not break collection */ }
+    }
     this.total += s.length;
     if (this.head.length < this.headLimit) {
       const take = this.headLimit - this.head.length;

@@ -120,6 +120,8 @@ const ConfigSchema = z.object({
   audit: z.object({
     enabled: z.boolean().default(true),
     file: z.string().default(() => path.join(configDir(), 'audit.jsonl')),
+    /** Drop audit entries older than this many days (0 = keep forever). Pruned at startup and every 6 hours. */
+    retentionDays: z.number().int().nonnegative().max(3650).default(30),
   }).strict().prefault({}),
   hostKeys: z.object({
     file: z.string().default(() => path.join(configDir(), 'known_hosts.json')),

@@ -160,6 +160,7 @@ claude mcp add pamssh -- npx -y pamssh-mcp stdio
 | `defaults.maxSessionsPerTarget` | `4` | 每个目标最多同时保持几个活动会话（只计已连接、正在连接或正在执行命令的；失败或断开的不占名额）|
 | `policy.allow` / `policy.deny` | `[]` | 全局命令正则（多行模式）；目标上还可以再配一层 |
 | `audit.enabled` / `audit.file` | `true` / `~/.config/pamssh-mcp/audit.jsonl` | 本地审计日志 |
+| `audit.retentionDays` | `30` | 审计记录保留天数，服务启动时和每 6 小时清理一次过期记录；0 表示永久保留 |
 | `hostKeys.file` / `trustOnFirstUse` | `known_hosts.json` / `true` | 未 pin 指纹时首次记录，之后变化即拒绝 |
 | `pamServers.<id>.usernameTemplate` | `{pamUser}@{account}@{host}` | 可用占位符：`{pamUser}` `{account}` `{host}` `{pamHost}` `{target}` |
 | `pamServers.<id>.identity` | — | `fingerprint` / `publicKey` / `comment`（1Password 条目标题）/ `opRef`（`op://…`，需要 1Password CLI），可组合 |
@@ -197,8 +198,9 @@ pamssh-mcp token --admin --rotate   # 生成 / 更换管理令牌（旧配置没
 | 目标 | 增删改、复制、重命名；登录命令实时预览；策略测试（用未保存的草稿检查一条命令会不会被放行）；连接测试（真实登录一次）|
 | PAM 服务器 | 网关地址、PAM 账号、登录串模板及使用它的目标预览；从 SSH agent（1Password）列表里选择登录密钥；读取并固定网关主机指纹 |
 | 全局设置 | HTTP 服务、默认值、全局策略、审计、指纹校验、SSH agent、日志级别 |
-| 会话 | 当前保持的 SSH 会话、空闲剩余时间、使用旧配置的会话，可以关闭 |
-| 审计日志 | 按目标、事件、关键词筛选 |
+| 会话 | 当前保持的 SSH 会话（来源：agent / 管理页面 / CLI）、空闲剩余时间、使用旧配置的会话；可以关闭或在终端中打开 |
+| 终端 | 选定目标，新建或接入一个会话，像终端一样逐条执行命令并实时查看输出；`↑`/`↓` 历史、`Ctrl-C` 中断、`Ctrl-L` 清屏，可手动结束会话 |
+| 审计日志 | 按目标、事件、关键词筛选；显示保留期限，可立即清理过期记录 |
 | 主机指纹 | 首次连接记录和配置中固定的指纹，可删除记录 |
 | 服务日志 | 实时查看最近 1000 条日志 |
 | 配置文件 | 直接编辑完整 JSON，校验后应用到草稿 |
@@ -212,6 +214,8 @@ pamssh-mcp token --admin --rotate   # 生成 / 更换管理令牌（旧配置没
 - 编辑期间如果配置文件被别人或手工修改过，会拒绝保存并提示重新加载，不会覆盖对方的修改
 - 保存后立即应用，不需要重启：策略、超时、目标、PAM 服务器、审计、日志级别、令牌等对下一条命令生效；已删除目标的会话会被关闭；连接参数变了的会话标记为“使用旧配置”，关闭后按新配置重连
 - 只有 `server.host` / `port` / `path` 需要重启，页面会提示
+
+**终端**：在“终端”页选择目标，新建会话（独立 PAM 登录，可能弹出 1Password 授权）或接入已有会话（例如 agent 正在用的 `default`，接入后的 `cd`/`export` 会影响 agent）。命令通过和 agent 相同的持久 shell 执行：输出实时显示，结束后显示退出码，当前目录和环境变量在会话内保留。与 agent 一样，每条命令都经过命令策略检查并记入审计（来源记为“管理页面”），stdin 为 `/dev/null`，不支持 vim、top、less 等交互程序。`结束会话` 会退出远端 shell、释放 PAM 登录。
 
 令牌在页面里默认隐藏，需要时点“显示”（会记一条日志）。管理接口也可以用 `Authorization: Bearer <管理令牌>` 从脚本调用。
 
@@ -230,7 +234,7 @@ launchctl load ~/Library/LaunchAgents/io.github.pamssh-mcp.plist
 - 这个服务等于把 **PAM 特权 shell** 交给了持有令牌的调用方。保持监听 `127.0.0.1`，令牌只放在环境变量或密钥管理里，泄露后用 `pamssh-mcp token --rotate` 轮换。
 - 管理令牌能修改策略和目标，权限高于 MCP 令牌：不要交给 agent，也不要和 MCP 令牌设成同一个（配置校验会拒绝）。
 - allow/deny 正则只是防止 agent 失误的护栏，不是安全边界。真正的边界是 PAM 授权和目标账号权限，建议给 agent 用权限最小的目标账号。
-- 审计日志不记录命令输出；PAM 网关自己的录像仍是权威审计。
+- 审计日志不记录命令输出；PAM 网关自己的录像仍是权威审计。本地审计默认只保留 30 天（`audit.retentionDays`），需要长期留存时先归档或调大天数。
 - 1Password 授权建议设为“每个新应用都需要批准”，并设置合适的记住时长。
 
 ## 本地调试：mock PAM 网关
