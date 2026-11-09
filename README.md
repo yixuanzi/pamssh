@@ -123,6 +123,15 @@ claude mcp add pamssh -- npx -y pamssh-mcp stdio
 | `pam_list_sessions` | 列出当前持有的会话：状态、cwd、命令数、最后活动时间 |
 | `pam_close_session` | 登出并释放特权会话 |
 
+**会话**：`pam_exec` 的 `session` 参数决定在哪个 shell 里执行。同名复用同一个 shell（`cd`、环境变量保留），新名字会建立一个独立的 PAM 登录：
+
+```json
+{ "target": "web-01", "session": "build", "command": "cd /srv/app && make" }
+{ "target": "web-01", "session": "logs",  "command": "tail -n 200 /var/log/app.log" }
+```
+
+同一会话里的命令依次执行，需要并行或隔离环境时才开新会话（每个新会话都要一次登录和签名）。每个目标同时最多 `maxSessionsPerTarget` 个活动会话，满了需要复用或用 `pam_close_session` 关闭一个。登录失败或已断开的会话不占名额，10 分钟后自动清理；因空闲超时或断线重建的会话，下一次调用会标注 `RECONNECTED`。
+
 `pam_exec` 的返回形如：
 
 ```
@@ -148,7 +157,7 @@ claude mcp add pamssh -- npx -y pamssh-mcp stdio
 | `defaults.commandTimeoutMs` | `120000` | 单条命令超时，超时发送 Ctrl-C |
 | `defaults.maxOutputChars` | `20000` | 单条命令最大返回字符数。Claude Code 默认单个 MCP 工具结果上限约 25k token，超过会转存文件，不建议调高 |
 | `defaults.idleTimeoutMinutes` | `30` | 会话空闲多久自动登出（0 表示不回收）|
-| `defaults.maxSessionsPerTarget` | `4` | 每个目标最多同时开几个命名会话 |
+| `defaults.maxSessionsPerTarget` | `4` | 每个目标最多同时保持几个活动会话（只计已连接、正在连接或正在执行命令的；失败或断开的不占名额）|
 | `policy.allow` / `policy.deny` | `[]` | 全局命令正则（多行模式）；目标上还可以再配一层 |
 | `audit.enabled` / `audit.file` | `true` / `~/.config/pamssh-mcp/audit.jsonl` | 本地审计日志 |
 | `hostKeys.file` / `trustOnFirstUse` | `known_hosts.json` / `true` | 未 pin 指纹时首次记录，之后变化即拒绝 |

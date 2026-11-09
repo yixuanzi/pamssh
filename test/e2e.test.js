@@ -328,3 +328,49 @@ test('admin API: agent keys, host key scan, connection test', { skip }, async ()
     await http.close();
   }
 });
+
+test('maxSessions counts only live logins; dead ones free their slot', { skip }, async () => {
+  const cfg = makeConfig();
+  cfg.targets.web.maxSessions = 2;
+  const m = new SessionManager(cfg, { logger: silentLogger });
+  try {
+    await m.exec('web', 'cd /tmp', { session: 'a' });
+    await m.exec('web', 'true', { session: 'b' });
+    await assert.rejects(m.exec('web', 'true', { session: 'c' }), /already has 2 active sessions \(max 2\): a \(ready\), b \(ready\)/);
+    // reusing a live session is always fine
+    assert.match((await m.exec('web', 'pwd', { session: 'a' })).output, /tmp/);
+
+    // remote exit: "a" stays listed as disconnected but no longer takes a slot
+    assert.equal((await m.exec('web', 'exit 0', { session: 'a' })).sessionEnded, true);
+    assert.equal(m.listSessions().find((s) => s.session === 'a').active, false);
+    await m.exec('web', 'true', { session: 'c' });
+
+    // reviving "a" needs a login, which must fit under the limit again
+    await assert.rejects(m.exec('web', 'true', { session: 'a' }), /already has 2 active sessions/);
+    m.closeSession('web', 'c');
+    const back = await m.exec('web', 'pwd', { session: 'a' });
+    assert.equal(back.reconnected, true, 'agent is told its cwd/env were lost');
+  } finally {
+    await m.closeAll();
+  }
+});
+
+test('idle logout is reported as RECONNECTED on the next command', { skip }, async () => {
+  const cfg = makeConfig();
+  cfg.targets.web.idleTimeoutMinutes = 0.0001; // 6 ms
+  const m = new SessionManager(cfg, { logger: silentLogger });
+  try {
+    await m.exec('web', 'cd /tmp && export KEEP=1');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    m._reapIdle();
+    assert.equal(m.listSessions().length, 0, 'logged out after idling');
+    const r = await m.exec('web', 'echo "[${KEEP:-}]"');
+    assert.equal(r.reconnected, true);
+    assert.equal(r.output, '[]\n');
+    // a session closed on purpose is just new next time
+    m.closeSession('web');
+    assert.equal((await m.exec('web', 'true')).reconnected, false);
+  } finally {
+    await m.closeAll();
+  }
+});

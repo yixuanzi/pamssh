@@ -3,8 +3,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { UserError } from '../session-manager.js';
 import { VERSION } from '../version.js';
 
-const SESSION_DESC = 'Session name (default "default"). Use different names to keep independent shells on the same target, '
-  + 'e.g. one per task. Each name is a separate SSH login through the PAM gateway.';
+const SESSION_DESC = 'Session name (default "default"). The same name reuses the same shell; a new name opens an independent '
+  + 'shell (a separate PAM login), e.g. to run long tasks in parallel or keep environments apart. Commands in one session '
+  + 'run one at a time. Each target allows a limited number of active sessions (maxSessions in pam_list_targets); '
+  + 'close sessions you no longer need with pam_close_session.';
 
 export const SERVER_INSTRUCTIONS = `\
 pamssh-mcp runs shell commands on servers reached through a PAM (privileged access management) SSH gateway.

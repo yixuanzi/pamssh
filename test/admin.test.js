@@ -319,3 +319,21 @@ test('admin: login throttling and disabled state', async () => {
     await b.close();
   }
 });
+
+test('failed sessions do not count toward maxSessions and are dropped later', async () => {
+  const { file } = writeConfig({ defaults: { maxSessionsPerTarget: 2 } }); // PAM on port 1: every login fails
+  const m = new SessionManager(ConfigStore.load(file).config, { logger: silentLogger });
+  try {
+    for (const name of ['a', 'b', 'c']) {
+      await assert.rejects(m.exec('web', 'true', { session: name }), /network error/, `session ${name} must fail on connect, not on the limit`);
+    }
+    const listed = m.listSessions();
+    assert.deepEqual(listed.map((s) => `${s.session}:${s.state}:${s.active}`), ['a:error:false', 'b:error:false', 'c:error:false']);
+    m._reapIdle(Date.now() + 5 * 60_000);
+    assert.equal(m.listSessions().length, 3, 'kept for a while so the last error stays visible');
+    m._reapIdle(Date.now() + 11 * 60_000);
+    assert.equal(m.listSessions().length, 0);
+  } finally {
+    await m.closeAll();
+  }
+});

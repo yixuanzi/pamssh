@@ -11,6 +11,9 @@ import { ExecSession } from './ssh/exec-session.js';
 import { silentLogger } from './logger.js';
 
 const SESSION_NAME_RE = /^[A-Za-z0-9._-]{1,32}$/;
+/** Failed / disconnected sessions stay listed (with their last error) this long, then are dropped. */
+const DEAD_SESSION_TTL_MS = 10 * 60_000;
+const MAX_LOST_KEYS = 500;
 
 /** Settings that only take effect when a session (re)connects. */
 function connectionKey(t) {
@@ -42,12 +45,26 @@ class ManagedSession {
     this.lastCwd = null;
     this.hostKey = null;
     this.everConnected = false;
+    /** When the session last failed or lost its connection (null while usable). */
+    this.deadSince = null;
+    /** Replaces an earlier session of the same name whose shell state was lost. */
+    this.resumed = false;
     this.logger = manager.logger.child(this.key);
     this._connecting = null;
   }
 
   get alive() {
     return this.state === 'ready' && this.runner?.alive;
+  }
+
+  /** Holds (or is acquiring) a PAM login: these count toward maxSessions. */
+  get holdsLogin() {
+    return this.inflight > 0 || this.state === 'connecting' || Boolean(this.alive);
+  }
+
+  /** Failed to connect or lost its connection, and nothing is running in it. */
+  get dead() {
+    return (this.state === 'error' || this.state === 'disconnected') && this.inflight === 0;
   }
 
   /** Live connection was made with settings that have since changed in the config. */
@@ -103,9 +120,11 @@ class ManagedSession {
       this.connectedAt = new Date();
       this.everConnected = true;
       this.lastError = null;
+      this.deadSince = null;
       this.logger.info('session ready');
     } catch (err) {
       this.state = 'error';
+      this.deadSince = Date.now();
       this.lastError = err.message;
       this.logger.error(`connect failed: ${err.message}`);
       throw err;
@@ -115,7 +134,10 @@ class ManagedSession {
   _onRunnerClose(runner) {
     if (this.runner && this.runner !== runner) return;
     if (this.state === 'ready') this.logger.info('session closed by remote side');
-    if (this.state !== 'closed') this.state = 'disconnected';
+    if (this.state !== 'closed') {
+      this.state = 'disconnected';
+      this.deadSince = Date.now();
+    }
     this.lastCwd = null;
     try { this.client?.end(); } catch { /* ignore */ }
   }
@@ -124,7 +146,8 @@ class ManagedSession {
     this.inflight++;
     this.lastUsedAt = Date.now();
     try {
-      const reconnected = (await this.ensure()) && this.commandCount > 0;
+      const reconnected = (await this.ensure()) && (this.commandCount > 0 || this.resumed);
+      this.resumed = false;
       const result = await this.runner.run(command, opts);
       this.commandCount++;
       if (result.cwd) this.lastCwd = result.cwd;
@@ -151,6 +174,8 @@ class ManagedSession {
         ? this.connectedWith.login
         : `${this.target.username}@${this.target.pamServer.host}`,
       stale: this.stale,
+      /** Holds a PAM login and counts toward maxSessions. */
+      active: this.holdsLogin,
       mode: this.target.mode,
       cwd: this.lastCwd,
       commands: this.commandCount,
@@ -169,7 +194,13 @@ class ManagedSession {
  * this server and addressed by (target id, session name).
  */
 export class SessionManager {
-  constructor(config, { logger = silentLogger, audit, hostKeys, connect = connectPam, keySelectorBuilder = buildKeySelector } = {}) {
+  constructor(config, {
+    logger = silentLogger, audit, hostKeys, connect = connectPam, keySelectorBuilder = buildKeySelector,
+    deadSessionTtlMs = DEAD_SESSION_TTL_MS,
+  } = {}) {
+    this.deadSessionTtlMs = deadSessionTtlMs;
+    /** Session keys whose shell state was lost without the agent closing them (for the RECONNECTED notice). */
+    this._lost = new Map();
     this.config = config;
     this.logger = logger;
     this.audit = audit ?? new AuditLog(config.audit, { logger });
@@ -257,7 +288,8 @@ export class SessionManager {
         tags: t.tags,
         sessions: [...this.sessions.values()]
           .filter((s) => s.target.id === t.id && s.state !== 'closed')
-          .map((s) => ({ name: s.name, state: s.state, cwd: s.lastCwd })),
+          .map((s) => ({ name: s.name, state: s.state, active: s.holdsLogin, cwd: s.lastCwd })),
+        maxSessions: t.maxSessions,
       }));
   }
 
@@ -272,16 +304,32 @@ export class SessionManager {
       this.sessions.delete(key);
       s = undefined;
     }
-    if (!s && create) {
-      const open = [...this.sessions.values()].filter((x) => x.target.id === target.id && x.state !== 'closed');
-      if (open.length >= target.maxSessions) {
-        throw new UserError(`target "${target.id}" already has ${open.length} sessions (max ${target.maxSessions}); `
-          + `close one first: ${open.map((x) => x.name).join(', ')}`);
+    if (!create) return s;
+    // Only sessions that hold (or are acquiring) a PAM login count toward the
+    // limit; failed or disconnected ones do not. Reusing such a session (or
+    // creating a new one) needs a login, so it must fit under the limit.
+    if (!s?.holdsLogin) {
+      const active = [...this.sessions.values()].filter((x) => x.target.id === target.id && x !== s && x.holdsLogin);
+      if (active.length >= target.maxSessions) {
+        const list = active.map((x) => `${x.name} (${x.state}${x.inflight ? ', running a command' : ''})`).join(', ');
+        throw new UserError(`target "${target.id}" already has ${active.length} active sessions (max ${target.maxSessions}): `
+          + `${list}. Reuse one of them, or close one with pam_close_session.`);
       }
+    }
+    if (!s) {
       s = new ManagedSession(this, target, name);
+      s.resumed = this._lost.delete(key);
       this.sessions.set(key, s);
     }
     return s;
+  }
+
+  /** Remember that `s` lost its shell state, so a later session with the same name reports RECONNECTED. */
+  _rememberLost(s) {
+    if (s.commandCount === 0 && !s.resumed) return;
+    this._lost.delete(s.key);
+    this._lost.set(s.key, Date.now());
+    if (this._lost.size > MAX_LOST_KEYS) this._lost.delete(this._lost.keys().next().value);
   }
 
   async openSession(targetId, name = 'default') {
@@ -333,15 +381,25 @@ export class SessionManager {
     if (!s) return false;
     s.close('closed by request');
     this.sessions.delete(s.key);
+    this._lost.delete(s.key); // closed on purpose: the next use is simply a new session
     return true;
   }
 
-  _reapIdle() {
-    const now = Date.now();
-    for (const s of this.sessions.values()) {
+  /**
+   * Runs every minute: logs out sessions idle past their timeout and drops
+   * failed / disconnected sessions after DEAD_SESSION_TTL_MS. In both cases a
+   * later session with the same name is reported as RECONNECTED.
+   */
+  _reapIdle(now = Date.now()) {
+    for (const s of [...this.sessions.values()]) {
       const idleMin = s.target.idleTimeoutMinutes;
       if (s.state === 'ready' && idleMin > 0 && s.inflight === 0 && now - s.lastUsedAt > idleMin * 60_000) {
         s.close(`idle for more than ${idleMin} minutes`);
+        this._rememberLost(s);
+        this.sessions.delete(s.key);
+      } else if (s.dead && s.deadSince !== null && now - s.deadSince >= this.deadSessionTtlMs) {
+        s.logger.debug(`dropping ${s.state} session`);
+        this._rememberLost(s);
         this.sessions.delete(s.key);
       }
     }

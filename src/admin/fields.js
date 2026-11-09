@@ -81,7 +81,7 @@ export const DEFAULTS_FIELDS = [
   },
   {
     key: 'maxSessionsPerTarget', label: '每个目标最多会话数', type: 'int', default: 4, min: 1,
-    help: '同一目标同时保持的命名会话上限（每个会话都是一次独立的 PAM 登录）。达到上限后新会话会被拒绝，需要先关闭已有会话。',
+    help: '同一目标最多同时保持几个活动会话。agent 用 `pam_exec` 的 `session` 参数区分会话：同名复用同一个 shell，新名字建立一个独立的 PAM 登录（适合并行任务或隔离环境）。只有已连接、正在连接或正在执行命令的会话计入上限；登录失败或已断开的会话不占名额，保留 10 分钟供查看错误后自动清理。达到上限时新会话会被拒绝，需要复用已有会话或先关闭一个。',
   },
 ];
 
@@ -292,7 +292,7 @@ export const TARGET_FIELDS = [
   },
   {
     key: 'maxSessions', label: '最多会话数', type: 'int', min: 1, inherit: 'defaults.maxSessionsPerTarget',
-    help: '覆盖全局默认的每目标会话上限。',
+    help: '覆盖全局默认的每目标活动会话上限（只计已连接、正在连接或正在执行命令的会话）。',
   },
   {
     key: 'policy', label: '命令策略', type: 'group',

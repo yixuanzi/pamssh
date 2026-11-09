@@ -12,6 +12,11 @@
 - Admin tools: policy tester, connection test, SSH agent key picker, gateway host key scan, sessions, audit log
   viewer, known host keys, live server log, raw JSON editor.
 - CLI: `init` also creates an admin token; `token --admin [--rotate]`.
+- Fix: `maxSessionsPerTarget` counted failed and disconnected sessions, which were never cleaned up, so a target
+  could stay "full" with no live session. Now only sessions holding a login count; dead sessions are dropped after
+  10 minutes; reviving one needs a free slot.
+- Fix: a session logged out for idling (or dropped after failing) now reports RECONNECTED on the next command with
+  the same name, so the agent knows its cwd/env are gone.
 
 ## 0.1.0
 
