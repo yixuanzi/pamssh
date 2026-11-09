@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS LaunchAgent for pamssh-mcp.
+  1. Replace /Users/YOU and the pamssh-mcp path (`which pamssh-mcp`).
+  2. cp io.github.pamssh-mcp.plist ~/Library/LaunchAgents/
+  3. launchctl load ~/Library/LaunchAgents/io.github.pamssh-mcp.plist
+  Must be a LaunchAgent (runs in your login session) so it can reach the
+  1Password SSH agent and show its approval prompts.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.pamssh-mcp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/pamssh-mcp</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/YOU</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/pamssh-mcp.log</string>
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/pamssh-mcp.log</string>
+</dict>
+</plist>

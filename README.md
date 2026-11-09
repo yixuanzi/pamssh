@@ -1,0 +1,228 @@
+# pamssh-mcp
+
+通过 **PAM 堡垒机** 在目标服务器上执行命令的 [MCP](https://modelcontextprotocol.io) Server。
+认证走 **1Password SSH Agent**（私钥始终留在 1Password 里），并保持 **持久 SSH 会话**，
+AI agent 可以像人在终端里一样连续工作：`cd`、`export` 等状态在多次调用之间保留。
+
+```
+Agent ──MCP (Streamable HTTP / stdio)──► pamssh-mcp ──SSH──► PAM 网关 ──► 目标主机
+                                            │
+                                            └─ agent 协议 ─► 1Password（Touch ID 授权签名）
+```
+
+- 登录串与终端里一致：`ssh <PAM用户>@<目标账号>@<目标主机>@<PAM网关>`，格式可配置
+- 一次授权，长期复用：只在建立连接时签名一次，之后的命令不再弹窗
+- 只暴露指定的那一把公钥，避免 `Too many authentication failures`
+- 命令以明文写入 shell，PAM 录像 / 命令审计看到的就是真实命令
+- 超时自动 Ctrl-C 并恢复会话；断线、远端 exit、网关空闲踢出后自动重连
+- 安全默认：只监听 127.0.0.1、强制 Bearer Token、Host/Origin 校验、命令 allow/deny 护栏、本地 JSONL 审计、PAM 主机指纹 pin / TOFU
+
+原理、时序图和设计取舍见 [docs/design.md](docs/design.md)。
+
+## 环境要求
+
+- Node.js ≥ 20
+- 1Password 桌面端 8，已开启 **设置 → 开发者 → 使用 SSH 代理**，PAM 个人密钥保存在 agent 允许的保管库中
+- PAM 网关支持公钥认证，你的公钥已绑定到你的 PAM 个人账号
+- 本服务必须运行在装有并已解锁 1Password 的那台机器上（agent socket 是本机的）
+
+## 快速开始
+
+```bash
+npm install -g pamssh-mcp
+```
+
+**1. 生成配置**（`~/.config/pamssh-mcp/config.json`，权限 600，内含随机访问令牌）
+
+```bash
+pamssh-mcp init
+```
+
+**2. 找到 1Password 里的 PAM 密钥**（只读取公钥，不会弹窗）
+
+```bash
+pamssh-mcp keys
+```
+
+**3. 编辑配置**，填写 PAM 网关、个人账号、密钥和目标：
+
+```jsonc
+{
+  "server": { "host": "127.0.0.1", "port": 8765, "path": "/mcp", "authToken": "<init 生成>" },
+  "pamServers": {
+    "pam-prod": {
+      "host": "pam.example.com",
+      "port": 22,
+      "user": "alice",                                  // 你的 PAM 个人账号
+      "usernameTemplate": "{pamUser}@{account}@{host}", // 拼出 alice@root@10.0.0.11
+      "identity": { "fingerprint": "SHA256:xxxx" },     // 或 { "comment": "1Password 条目标题" }
+      "hostFingerprint": "SHA256:yyyy"                  // 可选：pin 网关主机指纹
+    }
+  },
+  "targets": {
+    "web-01": {
+      "pam": "pam-prod",
+      "host": "10.0.0.11",
+      "account": "root",
+      "description": "生产 Web 1 号机",
+      "tags": ["prod", "web"]
+    }
+  }
+}
+```
+
+**4. 验证登录**（第一次会弹出 1Password 授权）
+
+```bash
+pamssh-mcp targets       # 打印每个目标的实际登录串，可以和你在终端里用的对比
+pamssh-mcp test web-01
+```
+
+**5. 启动服务**
+
+```bash
+pamssh-mcp serve
+```
+
+**6. 接入 agent**
+
+Claude Code：
+
+```bash
+claude mcp add --transport http pamssh http://127.0.0.1:8765/mcp --header "Authorization: Bearer $(pamssh-mcp token)"
+```
+
+或者在项目的 `.mcp.json` 中配置（令牌放在环境变量里）：
+
+```json
+{
+  "mcpServers": {
+    "pamssh": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": { "Authorization": "Bearer ${PAMSSH_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+如果不需要常驻服务，也可以让 agent 用 stdio 方式直接拉起（会话随 agent 进程结束而结束）：
+
+```bash
+claude mcp add pamssh -- npx -y pamssh-mcp stdio
+```
+
+## MCP 工具
+
+| 工具 | 作用 |
+| --- | --- |
+| `pam_list_targets` | 列出可用目标（id、账号、主机、描述、标签、已开会话），可按 `tag` 过滤 |
+| `pam_exec` | 在目标上执行命令。参数：`target`、`command`、可选 `session`（默认 `default`）、`timeout_ms` |
+| `pam_open_session` | 提前登录（提前触发 1Password 授权或检查权限）|
+| `pam_list_sessions` | 列出当前持有的会话：状态、cwd、命令数、最后活动时间 |
+| `pam_close_session` | 登出并释放特权会话 |
+
+`pam_exec` 的返回形如：
+
+```
+[exit=0 | 35ms | cwd=/var/log | session=web-01/default]
+<stdout 与 stderr 合并后的输出>
+```
+
+如果会话被重建，头部会出现 `RECONNECTED`，提示 agent 之前的 cwd/环境变量已丢失。超长输出保留头部 30% 和尾部 70%，中间标注截断字数。
+
+给 agent 的注意事项也写在了 MCP `instructions` 里：stdin 是 `/dev/null`，不要运行 vim/top/less 这类交互程序，改用 `top -b -n1`、`systemctl --no-pager`、`journalctl --no-pager -n 200` 等批处理参数。
+
+## 配置参考
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `server.host` / `port` / `path` | `127.0.0.1` / `8765` / `/mcp` | HTTP 监听地址 |
+| `server.authToken` | — | 必填，环境变量 `PAMSSH_MCP_TOKEN` 优先 |
+| `server.allowedHosts` / `allowedOrigins` | `[]` | 绑定非回环地址或需要浏览器访问时配置 |
+| `agentSocket` | 自动探测 | 优先级：配置 > `PAMSSH_AGENT_SOCK` > 1Password 默认位置 > `SSH_AUTH_SOCK` |
+| `defaults.commandTimeoutMs` | `120000` | 单条命令超时，超时发送 Ctrl-C |
+| `defaults.maxOutputChars` | `20000` | 单条命令最大返回字符数。Claude Code 默认单个 MCP 工具结果上限约 25k token，超过会转存文件，不建议调高 |
+| `defaults.idleTimeoutMinutes` | `30` | 会话空闲多久自动登出（0 表示不回收）|
+| `defaults.maxSessionsPerTarget` | `4` | 每个目标最多同时开几个命名会话 |
+| `policy.allow` / `policy.deny` | `[]` | 全局命令正则（多行模式）；目标上还可以再配一层 |
+| `audit.enabled` / `audit.file` | `true` / `~/.config/pamssh-mcp/audit.jsonl` | 本地审计日志 |
+| `hostKeys.file` / `trustOnFirstUse` | `known_hosts.json` / `true` | 未 pin 指纹时首次记录，之后变化即拒绝 |
+| `pamServers.<id>.usernameTemplate` | `{pamUser}@{account}@{host}` | 可用占位符：`{pamUser}` `{account}` `{host}` `{pamHost}` `{target}` |
+| `pamServers.<id>.identity` | — | `fingerprint` / `publicKey` / `comment`（1Password 条目标题）/ `opRef`（`op://…`，需要 1Password CLI），可组合 |
+| `pamServers.<id>.readyTimeoutMs` | `90000` | 握手 + 认证超时，包括等待你点 1Password 授权的时间 |
+| `pamServers.<id>.keepaliveIntervalMs` | `15000` | SSH keepalive，防止网关空闲断开 |
+| `targets.<id>.mode` | `shell` | `shell`：持久 PTY，保留状态；`exec`：每条命令一个 exec 通道（需要网关支持），stderr 单独返回 |
+| `targets.<id>.username` | — | 直接指定完整登录串，跳过模板 |
+| `targets.<id>.shell.init` | `[]` | 登录后先执行的命令，如 `export LANG=C.UTF-8`、`cd /srv/app` |
+| `targets.<id>.shell.settleMs` | `1500` | 登录输出静默多久后才初始化 shell（未识别到提示符时）；多跳网关登录慢时调大 |
+| `targets.<id>.shell.readyTimeoutMs` | `30000` | 等待目标 shell 就绪的总时长 |
+
+完整示例见 [examples/config.example.json](examples/config.example.json)。
+
+## 作为后台服务运行（macOS）
+
+参考 [examples/launchd/io.github.pamssh-mcp.plist](examples/launchd/io.github.pamssh-mcp.plist)，放到 `~/Library/LaunchAgents/` 后：
+
+```bash
+launchctl load ~/Library/LaunchAgents/io.github.pamssh-mcp.plist
+```
+
+必须用 LaunchAgent（用户会话内）而不是 LaunchDaemon，否则访问不到 1Password，也无法弹出授权。
+
+## 安全须知
+
+- 这个服务等于把 **PAM 特权 shell** 交给了持有令牌的调用方。保持监听 `127.0.0.1`，令牌只放在环境变量或密钥管理里，泄露后用 `pamssh-mcp token --rotate` 轮换。
+- allow/deny 正则只是防止 agent 失误的护栏，不是安全边界。真正的边界是 PAM 授权和目标账号权限，建议给 agent 用权限最小的目标账号。
+- 审计日志不记录命令输出；PAM 网关自己的录像仍是权威审计。
+- 1Password 授权建议设为“每个新应用都需要批准”，并设置合适的记住时长。
+
+## 本地调试：mock PAM 网关
+
+仓库附带一个模拟网关：按 `user@account@host` 解析登录串，用公钥验签，然后在本机真实 PTY 里起一个 shell 充当“目标主机”。可以用它在没有真实 PAM 的情况下走通 1Password 授权的全流程：
+
+```bash
+# 用 1Password 里的公钥启动（pamssh-mcp keys 可以看到公钥）
+node examples/mock-pam-server.js --port 2222 --authorized-key "ssh-ed25519 AAAA... PAM Key"
+# 也可以模拟不支持 exec 的网关
+node examples/mock-pam-server.js --authorized-keys ~/.ssh/id_ed25519.pub --no-exec
+```
+
+然后把配置里的 PAM 网关指向 `127.0.0.1:2222`。它会给出本机真实 shell，只在本机调试时使用。
+
+## 开发
+
+```bash
+npm install
+npm test          # 单元测试 + 端到端（需要 ssh-agent / ssh-keygen / script / bash）
+```
+
+端到端测试用真实的 `ssh-agent` 代替 1Password，经过 mock PAM 网关和真实 PTY shell，再通过 MCP SDK 客户端走 Streamable HTTP 调用全部工具。
+
+### 发布到 npm
+
+```bash
+npm pack --dry-run      # 检查要发布的文件
+npm version patch       # 或 minor / major
+npm publish --access public
+```
+
+`prepublishOnly` 会先跑测试。如果要用组织 scope（如 `@your-org/pamssh-mcp`），修改 `package.json` 的 `name`。
+
+> 安装时 npm 可能提示 `ssh2` / `cpu-features` 的安装脚本被拦截：那是可选的原生加速模块，不安装时 ssh2 会自动使用纯 JS 实现，功能不受影响。
+
+## 常见问题
+
+**每次连接都弹 1Password？** 在 1Password → 设置 → 开发者里调整授权记住时长。另外，会话保持期间不会重新签名，只有新建会话或重连时才会再签。
+
+**`no key in the SSH agent matches identity`？** 错误信息会列出 agent 当前提供的所有公钥，对照修改 `identity`。注意 1Password 的 agent 只暴露允许保管库中的密钥（默认是 Personal/Private，可以用 `~/.config/1Password/ssh/agent.toml` 调整）。
+
+**`PAM authentication failed`？** 依次检查：1Password 是否点了批准；公钥是否绑定到了 `user` 对应的 PAM 账号；`pamssh-mcp targets` 打印的登录串，和你在终端里能登录成功的那条命令是否一致。
+
+**1Password 已经批准了，还是 `PAM authentication failed`？** 部分网关要求“公钥 + keyboard-interactive”两步认证。没有提示问题的第二步会自动通过；如果报错里出现 `asked for keyboard-interactive input ("Verification code: ")` 之类的提示，说明网关要求 OTP，当前版本不会代答。可以用 `PAMSSH_SSH_DEBUG=1 PAMSSH_LOG_LEVEL=debug pamssh-mcp test <target>` 查看完整的认证过程。
+
+**`remote side did not become a usable POSIX shell`？** 多跳网关（跳板机 → 录像 → 目标）可能丢弃目标 shell 启动前收到的输入，程序会等待登录输出稳定后再初始化，失败时自动重发。如果网关登录特别慢，可以调大目标的 `shell.settleMs` / `shell.readyTimeoutMs`。其他情况（下同）： 说明登录后网关没有直接进入目标的 shell，比如弹出了资产选择菜单、二次认证，或者目标不是 POSIX shell（例如网络设备）。错误信息里附带了网关最后输出的内容，据此调整 `usernameTemplate`，或确认该网关支持直连目标的登录格式。
+
+## License
+
+MIT

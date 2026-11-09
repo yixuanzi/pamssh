@@ -1,0 +1,84 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "path": "/mcp",
+    "authToken": "replace-me-with-output-of-pamssh-mcp-init"
+  },
+  "defaults": {
+    "commandTimeoutMs": 120000,
+    "maxOutputChars": 20000,
+    "idleTimeoutMinutes": 30,
+    "maxSessionsPerTarget": 4
+  },
+  "policy": {
+    "deny": [
+      "(^|[;&|\\s])rm\\s+(-[A-Za-z]*[rRf][A-Za-z]*\\s+)+(/|/\\*|~)(\\s|$)",
+      "(^|[;&|\\s])(mkfs(\\.\\w+)?|fdisk|parted|wipefs)\\s",
+      "(^|[;&|\\s])dd\\s+.*\\bof=/dev/",
+      "(^|[;&|(]\\s*|\\bsudo\\s+)(shutdown|reboot|halt|poweroff|init\\s+[06])(\\s|;|$)",
+      "\\bsystemctl\\s+(reboot|poweroff|halt)\\b",
+      ":\\(\\)\\s*\\{\\s*:\\|:&\\s*\\};:"
+    ]
+  },
+  "audit": {
+    "enabled": true
+  },
+  "hostKeys": {
+    "trustOnFirstUse": true
+  },
+  "pamServers": {
+    "pam-prod": {
+      "host": "pam.example.com",
+      "port": 22,
+      "user": "alice",
+      "usernameTemplate": "{pamUser}@{account}@{host}",
+      "hostFingerprint": "SHA256:REPLACEwithGATEWAYhostKEYfingerprint",
+      "identity": {
+        "fingerprint": "SHA256:REPLACEwithYOURkeyFINGERPRINTfromKEYScmd"
+      }
+    },
+    "pam-test": {
+      "host": "pam-test.example.com",
+      "port": 2222,
+      "user": "alice",
+      "usernameTemplate": "{pamUser}@{account}@{host}",
+      "identity": {
+        "comment": "PAM SSH Key"
+      },
+      "readyTimeoutMs": 120000
+    }
+  },
+  "targets": {
+    "web-01": {
+      "pam": "pam-prod",
+      "host": "10.0.0.11",
+      "account": "root",
+      "description": "Production web server #1 (nginx, app in /srv/app)",
+      "tags": ["prod", "web"],
+      "shell": {
+        "init": ["export LANG=C.UTF-8", "cd /srv/app"]
+      }
+    },
+    "db-01-readonly": {
+      "pam": "pam-prod",
+      "host": "10.0.0.21",
+      "account": "ops-ro",
+      "description": "Production MySQL host, read-only diagnostics only",
+      "tags": ["prod", "db"],
+      "policy": {
+        "allow": ["^\\s*(ls|cat|head|tail|grep|df|du|free|uptime|ps|ss|netstat|journalctl|systemctl\\s+status)\\b"]
+      },
+      "commandTimeoutMs": 30000
+    },
+    "build-01": {
+      "pam": "pam-test",
+      "host": "build-01.internal",
+      "account": "deploy",
+      "description": "CI build box; gateway supports exec channels",
+      "tags": ["test"],
+      "mode": "exec",
+      "idleTimeoutMinutes": 120
+    }
+  }
+}

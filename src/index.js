@@ -1,0 +1,15 @@
+export { loadConfig, parseConfig, resolveTarget, renderUsername, exampleConfig, ConfigError } from './config.js';
+export { SessionManager, UserError } from './session-manager.js';
+export { SelectiveAgent, buildKeySelector, listAgentIdentities, fingerprintOfBlob } from './agent.js';
+export { HostKeyStore } from './hostkeys.js';
+export { checkPolicy } from './policy.js';
+export { AuditLog } from './audit.js';
+export { ShellSession, MarkerParser, wrapCommand, buildPrelude } from './ssh/shell-session.js';
+export { ExecSession } from './ssh/exec-session.js';
+export { connectPam, PamConnectError } from './ssh/connection.js';
+export { createMcpServer, SERVER_INSTRUCTIONS } from './mcp/tools.js';
+export { startHttpServer } from './mcp/http-server.js';
+export { startStdioServer } from './mcp/stdio-server.js';
+export { createLogger } from './logger.js';
+export { resolveAgentSocket, onePasswordAgentSocket, defaultConfigPath } from './paths.js';
+export { VERSION } from './version.js';
