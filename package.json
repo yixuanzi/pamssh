@@ -1,0 +1,51 @@
+{
+  "name": "pamssh-mcp",
+  "version": "0.1.0",
+  "description": "MCP server (Streamable HTTP / stdio) that keeps persistent SSH shell sessions to PAM-managed hosts, authenticating through the 1Password SSH agent.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ssh",
+    "pam",
+    "bastion",
+    "jumpserver",
+    "1password",
+    "ssh-agent",
+    "agent"
+  ],
+  "license": "MIT",
+  "author": "",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "pamssh-mcp": "bin/pamssh-mcp.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "examples/",
+    "docs/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node bin/pamssh-mcp.js serve",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
+    "test:unit": "node --test test/config.test.js test/policy.test.js test/shell-parser.test.js test/hostkeys.test.js",
+    "mock-pam": "node examples/mock-pam-server.js",
+    "prepublishOnly": "npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "ssh2": "^1.17.0",
+    "zod": "^4.6.7"
+  }
+}
