@@ -247,3 +247,84 @@ test('Streamable HTTP MCP endpoint', { skip }, async () => {
     await http.close();
   }
 });
+
+test('hot reload: live sessions go stale and reconnect with the new settings', { skip }, async () => {
+  const m = new SessionManager(makeConfig(), { logger: silentLogger });
+  try {
+    await m.exec('web', 'echo first');
+    assert.equal(m.listSessions()[0].stale, false);
+    const next = makeConfig();
+    next.pamServers.mock.usernameTemplate = '{pamUser}@{account}@{host}';
+    next.targets.web.account = 'deploy';
+    const res = m.updateConfig(next);
+    assert.deepEqual(res.staleSessions, ['web#default']);
+    const s = m.listSessions()[0];
+    assert.equal(s.stale, true);
+    assert.equal(s.login, `alice@root@web-01@127.0.0.1`, 'live session still shows the login it used');
+    // policy edits apply immediately even to the live session
+    next.targets.web.policy = { allow: [], deny: ['^echo blocked'] };
+    m.updateConfig(next);
+    await assert.rejects(m.exec('web', 'echo blocked'), /blocked by policy/);
+    m.closeSession('web');
+    const before = mock.logins.length;
+    await m.exec('web', 'true');
+    assert.equal(mock.logins.at(-1).account, 'deploy', 'reconnected with the new account');
+    assert.equal(mock.logins.length, before + 1);
+    assert.equal(m.listSessions()[0].stale, false);
+  } finally {
+    await m.closeAll();
+  }
+});
+
+test('admin API: agent keys, host key scan, connection test', { skip }, async () => {
+  const { ConfigStore } = await import('../src/config-store.js');
+  const file = path.join(dir, 'admin-config.json');
+  const ADMIN = 'x'.repeat(24);
+  fs.writeFileSync(file, JSON.stringify({
+    server: { port: 0, authToken: TOKEN, adminToken: ADMIN },
+    agentSocket: agent.sock,
+    audit: { file: path.join(dir, 'audit-admin.jsonl') },
+    hostKeys: { file: path.join(dir, 'known-admin.json') },
+    pamServers: { mock: { host: '127.0.0.1', port: mock.port, user: 'alice', identity: { comment: 'PAM Key' } } },
+    targets: { web: { host: 'web-01', account: 'root' }, locked: { host: 'web-01', account: 'root', policy: { allow: ['^ls'] } } },
+  }));
+  const store = ConfigStore.load(file);
+  const manager = new SessionManager(store.config, { logger: silentLogger });
+  const http = await startHttpServer({ store, manager, logger: silentLogger });
+  const get = (p) => fetch(`http://127.0.0.1:${http.port}/admin/api${p}`, { headers: { authorization: `Bearer ${ADMIN}` } }).then((r) => r.json());
+  const post = (p, body) => fetch(`http://127.0.0.1:${http.port}/admin/api${p}`, {
+    method: 'POST', headers: { authorization: `Bearer ${ADMIN}`, 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  try {
+    const keys = await get('/agent/keys');
+    assert.deepEqual(keys.keys.map((k) => k.comment).sort(), ['PAM Key', 'Some Other Key']);
+
+    const loginsBefore = mock.logins.length;
+    const scan = await post('/hostkeys/scan', { host: '127.0.0.1', port: mock.port });
+    assert.equal(scan.fingerprint, mock.hostKeyFingerprint);
+    assert.equal(scan.type, 'ssh-ed25519');
+    assert.equal(mock.logins.length, loginsBefore, 'scan must not log in');
+
+    const ok = await post('/targets/test', { target: 'web' });
+    assert.equal(ok.ok, true, ok.error);
+    assert.match(ok.output, /\n/);
+    assert.equal(ok.hostKey, mock.hostKeyFingerprint);
+    assert.equal(manager.listSessions().length, 0, 'test session is closed afterwards');
+
+    const blocked = await post('/targets/test', { target: 'locked' });
+    assert.equal(blocked.ok, true);
+    assert.match(blocked.note, /blocked by policy/);
+
+    const known = await get('/hostkeys');
+    assert.deepEqual(known.known['127.0.0.1:' + mock.port], [mock.hostKeyFingerprint]);
+    assert.equal((await post('/hostkeys/delete', { hostId: `127.0.0.1:${mock.port}` })).ok, true);
+
+    const audit = await get('/audit?limit=50');
+    assert.ok(audit.entries.some((e) => e.actor?.client === 'admin-ui'));
+    const logs = await get('/logs');
+    assert.ok(Array.isArray(logs.entries));
+  } finally {
+    await manager.closeAll();
+    await http.close();
+  }
+});

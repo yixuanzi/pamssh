@@ -102,6 +102,10 @@ const ConfigSchema = z.object({
     allowedOrigins: z.array(z.string()).default([]),
     /** Drop MCP (HTTP) sessions idle for this long. SSH sessions are managed separately. */
     mcpSessionIdleMinutes: z.number().positive().default(120),
+    /** Token for the admin web UI at /admin (disabled when unset). Env PAMSSH_ADMIN_TOKEN overrides it. */
+    adminToken: z.string().min(16).optional(),
+    /** Admin UI logins expire after this many idle minutes. */
+    adminSessionMinutes: z.number().positive().max(1440).default(60),
   }).strict().prefault({}),
   agentSocket: z.string().optional(),
   defaults: z.object({
@@ -129,6 +133,12 @@ const ConfigSchema = z.object({
   const pamIds = Object.keys(cfg.pamServers);
   if (pamIds.length === 0) {
     ctx.addIssue({ code: 'custom', path: ['pamServers'], message: 'at least one PAM server is required' });
+  }
+  if (/^\/admin(\/|$)/.test(cfg.server.path) || cfg.server.path === '/healthz') {
+    ctx.addIssue({ code: 'custom', path: ['server', 'path'], message: 'conflicts with the built-in /admin or /healthz routes' });
+  }
+  if (cfg.server.adminToken && cfg.server.adminToken === cfg.server.authToken) {
+    ctx.addIssue({ code: 'custom', path: ['server', 'adminToken'], message: 'must differ from server.authToken' });
   }
   for (const [id, pam] of Object.entries(cfg.pamServers)) {
     for (const fp of toArray(pam.hostFingerprint)) {
@@ -184,13 +194,67 @@ export function renderUsername(template, vars) {
   });
 }
 
+export { ConfigSchema, PamServerSchema, TargetSchema };
+
+/** Variables an operator can set to override config values at runtime. */
+export const ENV_OVERRIDES = {
+  PAMSSH_MCP_TOKEN: 'server.authToken',
+  PAMSSH_ADMIN_TOKEN: 'server.adminToken',
+  PAMSSH_LOG_LEVEL: 'logLevel',
+};
+
+const ZH_MESSAGES = [
+  [/^at least one PAM server is required$/, '至少需要配置一个 PAM 服务器'],
+  [/^must differ from server\.authToken$/, '不能与 server.authToken（MCP 令牌）相同'],
+  [/^conflicts with the built-in \/admin or \/healthz routes$/, '与内置的 /admin、/healthz 路径冲突'],
+  [/^"(.*)" must look like SHA256:xxxx$/, '"$1" 格式应为 SHA256:xxxx（ssh-keygen -lf / pamssh-mcp keys 输出的格式）'],
+  [/^must look like SHA256:xxxx$/, '格式应为 SHA256:xxxx'],
+  [/^must start with op:\/\/$/, '必须以 op:// 开头（1Password 密钥引用）'],
+  [/^unknown placeholder \{(\w+)\} .*$/, '未知占位符 {$1}，可用：{pamUser} {account} {host} {pamHost} {target}'],
+  [/^required when more than one PAM server is configured$/, '配置了多个 PAM 服务器时必须指定'],
+  [/^unknown PAM server "(.*)"$/, '引用了不存在的 PAM 服务器 "$1"'],
+  [/^invalid regex: (.*)$/, '正则表达式无效：$1'],
+  [/^invalid id$/, 'ID 只能包含字母、数字、点、下划线和连字符，且以字母或数字开头'],
+];
+
+function localize(message) {
+  for (const [re, zh] of ZH_MESSAGES) if (re.test(message)) return message.replace(re, zh);
+  return message;
+}
+
+/**
+ * Validate without throwing. Issues carry the path as an array so ids that
+ * contain dots stay unambiguous. `locale: 'zh'` translates messages.
+ */
+export function validateConfig(raw, { file, locale } = {}) {
+  const zh = locale === 'zh';
+  const result = ConfigSchema.safeParse(raw, zh ? { error: z.locales.zhCN().localeError } : undefined);
+  if (!result.success) {
+    const issues = [];
+    for (const i of result.error.issues) {
+      if (i.code === 'unrecognized_keys') {
+        for (const k of i.keys) {
+          issues.push({ path: [...i.path, k].map(String), message: zh ? `未知字段 "${k}"（拼写错误？）` : `unrecognized key "${k}"` });
+        }
+      } else {
+        issues.push({ path: i.path.map(String), message: zh ? localize(i.message) : i.message });
+      }
+    }
+    return { ok: false, issues };
+  }
+  return { ok: true, issues: [], config: normalize(result.data, file) };
+}
+
 /** Validate a plain object and return the normalized config. */
 export function parseConfig(raw, { file } = {}) {
   const result = ConfigSchema.safeParse(raw);
   if (!result.success) {
     throw new ConfigError(`invalid configuration\n${z.prettifyError(result.error)}`, file);
   }
-  const cfg = result.data;
+  return normalize(result.data, file);
+}
+
+function normalize(cfg, file) {
   const pamIds = Object.keys(cfg.pamServers);
 
   for (const pam of Object.values(cfg.pamServers)) {
@@ -206,6 +270,7 @@ export function parseConfig(raw, { file } = {}) {
   cfg.audit.file = expandPath(cfg.audit.file);
   cfg.hostKeys.file = expandPath(cfg.hostKeys.file);
   if (process.env.PAMSSH_MCP_TOKEN) cfg.server.authToken = process.env.PAMSSH_MCP_TOKEN;
+  if (process.env.PAMSSH_ADMIN_TOKEN) cfg.server.adminToken = process.env.PAMSSH_ADMIN_TOKEN;
   if (process.env.PAMSSH_LOG_LEVEL) cfg.logLevel = process.env.PAMSSH_LOG_LEVEL;
   cfg.file = file;
   return cfg;
@@ -261,13 +326,14 @@ export function resolveTarget(cfg, targetId) {
 }
 
 /** Starter config written by `pamssh-mcp init`. */
-export function exampleConfig({ authToken }) {
+export function exampleConfig({ authToken, adminToken }) {
   return {
     server: {
       host: '127.0.0.1',
       port: 8765,
       path: '/mcp',
       authToken,
+      ...(adminToken ? { adminToken } : {}),
     },
     defaults: {
       commandTimeoutMs: 120000,

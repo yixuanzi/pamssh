@@ -3,6 +3,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createMcpServer } from './tools.js';
+import { createAdmin } from '../admin/index.js';
 import { VERSION } from '../version.js';
 
 const MAX_BODY = 4 * 1024 * 1024;
@@ -53,33 +54,47 @@ function hostnameOf(hostHeader) {
 /**
  * Streamable HTTP MCP endpoint (MCP spec 2025-03-26+), stateful: one MCP
  * session (and McpServer instance) per client, all sharing one SessionManager.
+ *
+ * Pass `store` (a ConfigStore) to enable the admin UI at /admin and to make
+ * token / Host / Origin / idle settings follow config changes without a
+ * restart. Bind address, port and MCP path are fixed until restart.
  */
-export async function startHttpServer({ config, manager, logger, host: hostOverride, port: portOverride }) {
-  const opts = config.server;
-  const bindHost = hostOverride ?? opts.host;
-  const bindPort = portOverride ?? opts.port;
-  if (!opts.authToken) {
+export async function startHttpServer({ config, store, manager, logger, host: hostOverride, port: portOverride, cliLogLevel }) {
+  const getConfig = () => (store ? store.config : config);
+  const initial = getConfig().server;
+  const bindHost = hostOverride ?? initial.host;
+  const bindPort = portOverride ?? initial.port;
+  const mcpPath = initial.path;
+  if (!initial.authToken) {
     throw new Error('server.authToken is not set. Run `pamssh-mcp init` (or `pamssh-mcp token --rotate`) '
       + 'or set PAMSSH_MCP_TOKEN.');
   }
-  const tokenHash = sha256(opts.authToken);
   const loopbackBind = LOOPBACK.has(bindHost);
   const sessions = new Map();
+  const startedAt = Date.now();
+  // `configured`: server settings at startup, to tell which edits need a restart.
+  const running = {
+    host: bindHost, port: bindPort, path: mcpPath,
+    configured: { host: initial.host, port: initial.port, path: initial.path },
+  };
+  let admin = null;
 
   const authorized = (req) => {
+    const token = getConfig().server.authToken;
     const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
-    return Boolean(m) && timingSafeEqual(sha256(m[1].trim()), tokenHash);
+    return Boolean(token && m) && timingSafeEqual(sha256(m[1].trim()), sha256(token));
   };
 
   const hostAllowed = (req) => {
     const h = req.headers.host || '';
-    if (opts.allowedHosts.length) return opts.allowedHosts.includes(h) || opts.allowedHosts.includes(hostnameOf(h));
+    const allowed = getConfig().server.allowedHosts;
+    if (allowed.length) return allowed.includes(h) || allowed.includes(hostnameOf(h));
     return loopbackBind ? LOOPBACK.has(hostnameOf(h)) : true;
   };
 
   const originAllowed = (req) => {
     const origin = req.headers.origin;
-    return !origin || opts.allowedOrigins.includes(origin);
+    return !origin || getConfig().server.allowedOrigins.includes(origin);
   };
 
   async function newSession(req, res, body) {
@@ -105,8 +120,9 @@ export async function startHttpServer({ config, manager, logger, host: hostOverr
     if (url.pathname === '/healthz' && req.method === 'GET') {
       return sendJson(res, 200, { ok: true, name: 'pamssh-mcp', version: VERSION });
     }
-    if (url.pathname !== opts.path) return sendJson(res, 404, { error: 'not found' });
     if (!hostAllowed(req)) return sendJson(res, 403, { error: `host ${req.headers.host} not allowed` });
+    if (admin && await admin(req, res, url)) return undefined;
+    if (url.pathname !== mcpPath) return sendJson(res, 404, { error: 'not found' });
     if (!originAllowed(req)) return sendJson(res, 403, { error: `origin ${req.headers.origin} not allowed` });
     if (!authorized(req)) {
       return sendJson(res, 401, { error: 'missing or invalid bearer token' }, { 'www-authenticate': 'Bearer' });
@@ -139,6 +155,7 @@ export async function startHttpServer({ config, manager, logger, host: hostOverr
     }
 
     res.writeHead(405, { allow: 'GET, POST, DELETE' }).end();
+    return undefined;
   }
 
   const server = http.createServer((req, res) => {
@@ -149,7 +166,7 @@ export async function startHttpServer({ config, manager, logger, host: hostOverr
   });
 
   const reaper = setInterval(() => {
-    const cutoff = Date.now() - opts.mcpSessionIdleMinutes * 60_000;
+    const cutoff = Date.now() - getConfig().server.mcpSessionIdleMinutes * 60_000;
     for (const [id, e] of sessions) {
       if (e.lastSeen < cutoff) {
         logger.info(`MCP session ${id} idle, closing`);
@@ -168,8 +185,13 @@ export async function startHttpServer({ config, manager, logger, host: hostOverr
     });
   });
   const addr = server.address();
+  running.port = addr.port;
+  if (store) {
+    admin = createAdmin({ store, manager, logger, running, mcpSessions: sessions, startedAt, cliLogLevel });
+  }
   const shownHost = addr.family === 'IPv6' ? `[${addr.address}]` : addr.address;
-  const url = `http://${shownHost}:${addr.port}${opts.path}`;
+  const base = `http://${shownHost}:${addr.port}`;
+  const url = `${base}${mcpPath}`;
   if (!loopbackBind) {
     logger.warn(`listening on non-loopback address ${bindHost}: anyone who can reach it with the token gets a `
       + 'privileged shell. Put it behind TLS and restrict network access.');
@@ -177,6 +199,7 @@ export async function startHttpServer({ config, manager, logger, host: hostOverr
 
   return {
     url,
+    adminUrl: store ? `${base}/admin` : null,
     port: addr.port,
     server,
     sessions,

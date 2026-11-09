@@ -12,6 +12,13 @@ import { silentLogger } from './logger.js';
 
 const SESSION_NAME_RE = /^[A-Za-z0-9._-]{1,32}$/;
 
+/** Settings that only take effect when a session (re)connects. */
+function connectionKey(t) {
+  const p = t.pamServer;
+  return JSON.stringify([t.username, t.mode, t.shell, p.host, p.port, p.identity, p.agentSocket,
+    p.hostFingerprints, p.algorithms, p.readyTimeoutMs, p.keepaliveIntervalMs, p.keepaliveCountMax]);
+}
+
 export class UserError extends Error {
   constructor(message) {
     super(message);
@@ -43,6 +50,11 @@ class ManagedSession {
     return this.state === 'ready' && this.runner?.alive;
   }
 
+  /** Live connection was made with settings that have since changed in the config. */
+  get stale() {
+    return Boolean(this.alive && this.connectedWith && this.connectedWith.key !== connectionKey(this.target));
+  }
+
   /** Connect if needed. Resolves to true when this call (re)established the session. */
   ensure() {
     if (this.alive) return Promise.resolve(false);
@@ -53,7 +65,8 @@ class ManagedSession {
   }
 
   async _connect() {
-    const { target } = this;
+    // Always connect with the current config (it may have been edited since creation).
+    const target = this.target = this.manager.target(this.target.id);
     this.state = 'connecting';
     this.logger.info(`connecting via ${target.pamServer.host}:${target.pamServer.port} as "${target.username}"`);
     try {
@@ -83,6 +96,10 @@ class ManagedSession {
       }
       this.runner = runner;
       this.state = 'ready';
+      this.connectedWith = {
+        key: connectionKey(target),
+        login: `${target.username}@${target.pamServer.host}`,
+      };
       this.connectedAt = new Date();
       this.everConnected = true;
       this.lastError = null;
@@ -130,7 +147,10 @@ class ManagedSession {
       target: this.target.id,
       session: this.name,
       state: this.state,
-      login: `${this.target.username}@${this.target.pamServer.host}`,
+      login: this.alive && this.connectedWith
+        ? this.connectedWith.login
+        : `${this.target.username}@${this.target.pamServer.host}`,
+      stale: this.stale,
       mode: this.target.mode,
       cwd: this.lastCwd,
       commands: this.commandCount,
@@ -156,12 +176,49 @@ export class SessionManager {
     this.hostKeys = hostKeys ?? new HostKeyStore(config.hostKeys.file, {
       trustOnFirstUse: config.hostKeys.trustOnFirstUse, logger,
     });
+    this._ownAudit = !audit;
+    this._ownHostKeys = !hostKeys;
     this.connect = connect;
     this.keySelectorBuilder = keySelectorBuilder;
     this.sessions = new Map();
     this._selectors = new Map();
     this._reaper = setInterval(() => this._reapIdle(), 60_000);
     this._reaper.unref();
+  }
+
+  /**
+   * Swap in a new (validated, normalized) config without restarting.
+   * - policy, timeouts, limits, targets, PAM servers apply to the next command;
+   * - sessions of removed targets are closed;
+   * - live sessions whose connection settings changed keep running and are
+   *   reported as stale (they pick up the new settings when they reconnect).
+   */
+  updateConfig(config) {
+    const old = this.config;
+    this.config = config;
+    this._selectors.clear();
+    if (this._ownAudit && JSON.stringify(old.audit) !== JSON.stringify(config.audit)) {
+      this.audit = new AuditLog(config.audit, { logger: this.logger });
+    }
+    if (this._ownHostKeys && JSON.stringify(old.hostKeys) !== JSON.stringify(config.hostKeys)) {
+      this.hostKeys = new HostKeyStore(config.hostKeys.file, {
+        trustOnFirstUse: config.hostKeys.trustOnFirstUse, logger: this.logger,
+      });
+    }
+    const closed = [];
+    const stale = [];
+    for (const s of [...this.sessions.values()]) {
+      const next = resolveTarget(config, s.target.id);
+      if (!next) {
+        s.close('target removed from configuration');
+        this.sessions.delete(s.key);
+        closed.push(s.key);
+        continue;
+      }
+      s.target = next;
+      if (s.stale) stale.push(s.key);
+    }
+    return { closedSessions: closed, staleSessions: stale };
   }
 
   agentSocketFor(pam) {

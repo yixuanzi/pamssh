@@ -16,6 +16,7 @@ Agent ──MCP (Streamable HTTP / stdio)──► pamssh-mcp ──SSH──►
 - 命令以明文写入 shell，PAM 录像 / 命令审计看到的就是真实命令
 - 超时自动 Ctrl-C 并恢复会话；断线、远端 exit、网关空闲踢出后自动重连
 - 安全默认：只监听 127.0.0.1、强制 Bearer Token、Host/Origin 校验、命令 allow/deny 护栏、本地 JSONL 审计、PAM 主机指纹 pin / TOFU
+- 内置管理页面 `/admin`：用独立的管理令牌登录，在网页上管理全部配置（每个字段都有说明、默认值、示例和实时校验），保存后不重启即生效
 
 原理、时序图和设计取舍见 [docs/design.md](docs/design.md)。
 
@@ -139,6 +140,9 @@ claude mcp add pamssh -- npx -y pamssh-mcp stdio
 | --- | --- | --- |
 | `server.host` / `port` / `path` | `127.0.0.1` / `8765` / `/mcp` | HTTP 监听地址 |
 | `server.authToken` | — | 必填，环境变量 `PAMSSH_MCP_TOKEN` 优先 |
+| `server.adminToken` | — | 管理页面令牌，必须与 `authToken` 不同；不设置则管理页面关闭。环境变量 `PAMSSH_ADMIN_TOKEN` 优先 |
+| `server.adminSessionMinutes` | `60` | 管理页面登录无操作多久过期（最长 12 小时）|
+| `server.mcpSessionIdleMinutes` | `120` | agent 与本服务之间的 MCP 会话空闲回收时间（不影响 SSH 会话）|
 | `server.allowedHosts` / `allowedOrigins` | `[]` | 绑定非回环地址或需要浏览器访问时配置 |
 | `agentSocket` | 自动探测 | 优先级：配置 > `PAMSSH_AGENT_SOCK` > 1Password 默认位置 > `SSH_AUTH_SOCK` |
 | `defaults.commandTimeoutMs` | `120000` | 单条命令超时，超时发送 Ctrl-C |
@@ -158,7 +162,49 @@ claude mcp add pamssh -- npx -y pamssh-mcp stdio
 | `targets.<id>.shell.settleMs` | `1500` | 登录输出静默多久后才初始化 shell（未识别到提示符时）；多跳网关登录慢时调大 |
 | `targets.<id>.shell.readyTimeoutMs` | `30000` | 等待目标 shell 就绪的总时长 |
 
-完整示例见 [examples/config.example.json](examples/config.example.json)。
+完整示例见 [examples/config.example.json](examples/config.example.json)。以上每个字段在管理页面里都有更详细的说明。
+
+## 管理页面
+
+`pamssh-mcp serve` 同时提供管理页面：`http://127.0.0.1:8765/admin`。
+
+**登录**：使用管理令牌（`server.adminToken`），与给 agent 用的 MCP 令牌分开，这样 agent 即使拿到 MCP 令牌也无法修改约束它的策略。
+
+```bash
+pamssh-mcp token --admin            # 查看管理令牌
+```
+
+```bash
+pamssh-mcp token --admin --rotate   # 生成 / 更换管理令牌（旧配置没有时用它启用管理页面）
+```
+
+令牌只在登录时提交一次，换成服务端会话（HttpOnly、SameSite=Strict Cookie），不会保存在浏览器里。连续输错 5 次锁定 15 分钟。
+
+**功能**
+
+| 页面 | 内容 |
+| --- | --- |
+| 概览 | 服务地址、SSH agent 状态、会话数、需重启的修改、配置检查结果（点击直达对应字段）、接入命令 |
+| 目标 | 增删改、复制、重命名；登录命令实时预览；策略测试（用未保存的草稿检查一条命令会不会被放行）；连接测试（真实登录一次）|
+| PAM 服务器 | 网关地址、PAM 账号、登录串模板及使用它的目标预览；从 SSH agent（1Password）列表里选择登录密钥；读取并固定网关主机指纹 |
+| 全局设置 | HTTP 服务、默认值、全局策略、审计、指纹校验、SSH agent、日志级别 |
+| 会话 | 当前保持的 SSH 会话、空闲剩余时间、使用旧配置的会话，可以关闭 |
+| 审计日志 | 按目标、事件、关键词筛选 |
+| 主机指纹 | 首次连接记录和配置中固定的指纹，可删除记录 |
+| 服务日志 | 实时查看最近 1000 条日志 |
+| 配置文件 | 直接编辑完整 JSON，校验后应用到草稿 |
+| 备份 | 每次保存前自动备份（保留 30 份），查看差异并一键恢复；手工改文件后从磁盘重新加载 |
+
+**字段说明**：每个字段都标注了含义、默认值（或继承自哪个全局值）、示例、取值范围、时间单位换算（如 `300000` 显示为 `= 5 分钟`），以及“必填”“需重启生效”“被环境变量覆盖”等标记；有风险的设置会显示提醒。“隐藏字段说明”按钮可以收起说明。
+
+**编辑与保存**：所有修改先进入草稿，边改边由服务端校验，错误和建议直接显示在对应字段下，底部栏显示修改数量和校验状态（`⌘/Ctrl + S` 保存）。保存时：
+
+- 写入前自动备份；文件以 600 权限原子写入
+- 编辑期间如果配置文件被别人或手工修改过，会拒绝保存并提示重新加载，不会覆盖对方的修改
+- 保存后立即应用，不需要重启：策略、超时、目标、PAM 服务器、审计、日志级别、令牌等对下一条命令生效；已删除目标的会话会被关闭；连接参数变了的会话标记为“使用旧配置”，关闭后按新配置重连
+- 只有 `server.host` / `port` / `path` 需要重启，页面会提示
+
+令牌在页面里默认隐藏，需要时点“显示”（会记一条日志）。管理接口也可以用 `Authorization: Bearer <管理令牌>` 从脚本调用。
 
 ## 作为后台服务运行（macOS）
 
@@ -173,6 +219,7 @@ launchctl load ~/Library/LaunchAgents/io.github.pamssh-mcp.plist
 ## 安全须知
 
 - 这个服务等于把 **PAM 特权 shell** 交给了持有令牌的调用方。保持监听 `127.0.0.1`，令牌只放在环境变量或密钥管理里，泄露后用 `pamssh-mcp token --rotate` 轮换。
+- 管理令牌能修改策略和目标，权限高于 MCP 令牌：不要交给 agent，也不要和 MCP 令牌设成同一个（配置校验会拒绝）。
 - allow/deny 正则只是防止 agent 失误的护栏，不是安全边界。真正的边界是 PAM 授权和目标账号权限，建议给 agent 用权限最小的目标账号。
 - 审计日志不记录命令输出；PAM 网关自己的录像仍是权威审计。
 - 1Password 授权建议设为“每个新应用都需要批准”，并设置合适的记住时长。

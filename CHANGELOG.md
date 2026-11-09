@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Admin web UI at `/admin` on `pamssh-mcp serve`, behind a separate `server.adminToken` (must differ from the MCP
+  token): server-side sessions (HttpOnly, SameSite=Strict), CSRF checks, login lockout, strict CSP.
+- Manage every config field in forms generated from field metadata with help text, defaults, examples, units,
+  restart / env-override badges; live server-side validation (Chinese messages) and risk warnings per field.
+- Config changes apply without restart (policy, targets, PAM servers, limits, tokens, audit, log level); sessions of
+  removed targets are closed, live sessions with changed connection settings are flagged stale.
+- Atomic saves with automatic backups (30 kept), conflict detection against manual edits, reload from disk, restore.
+- Admin tools: policy tester, connection test, SSH agent key picker, gateway host key scan, sessions, audit log
+  viewer, known host keys, live server log, raw JSON editor.
+- CLI: `init` also creates an admin token; `token --admin [--rotate]`.
+
 ## 0.1.0
 
 - Initial release.

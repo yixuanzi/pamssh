@@ -7,6 +7,7 @@ import { listAgentIdentities } from './agent.js';
 import { createLogger } from './logger.js';
 import { resolveAgentSocket } from './paths.js';
 import { SessionManager } from './session-manager.js';
+import { ConfigStore } from './config-store.js';
 import { startHttpServer } from './mcp/http-server.js';
 import { startStdioServer } from './mcp/stdio-server.js';
 import { VERSION } from './version.js';
@@ -18,13 +19,13 @@ sessions, authenticating with your key in the 1Password SSH agent.
 Usage: pamssh-mcp <command> [options]
 
 Commands:
-  init                 Create a config file with a fresh access token
+  init                 Create a config file with fresh MCP and admin tokens
   keys                 List keys in the SSH agent (1Password) with fingerprints
   targets              List configured targets and their PAM login strings
   test <target>        Log in to a target and run a check command
-  serve                Start the Streamable HTTP MCP server
+  serve                Start the Streamable HTTP MCP server and the admin UI (/admin)
   stdio                Run the MCP server over stdio (spawned by an agent)
-  token                Print the HTTP access token (--rotate to replace it)
+  token                Print the MCP access token (--admin: admin UI token; --rotate: replace it)
 
 Options:
   -c, --config <file>  Config file (default: $PAMSSH_MCP_CONFIG or ~/.config/pamssh-mcp/config.json)
@@ -33,6 +34,7 @@ Options:
       --command <cmd>  test: command to run (default: id; hostname; pwd)
       --session <name> test: session name
       --socket <path>  keys: SSH agent socket to query
+      --admin          token: use the admin UI token instead of the MCP token
       --rotate         token: generate and store a new token
   -f, --force          init: overwrite an existing config
       --log-level <l>  error | warn | info | debug
@@ -48,6 +50,7 @@ const OPTIONS = {
   session: { type: 'string' },
   socket: { type: 'string' },
   rotate: { type: 'boolean' },
+  admin: { type: 'boolean' },
   force: { type: 'boolean', short: 'f' },
   'log-level': { type: 'string' },
   help: { type: 'boolean', short: 'h' },
@@ -89,7 +92,7 @@ const commands = {
     if (fs.existsSync(file) && !values.force) {
       throw new ConfigError('already exists (use --force to overwrite)', file);
     }
-    writeJsonPrivate(file, exampleConfig({ authToken: newToken() }));
+    writeJsonPrivate(file, exampleConfig({ authToken: newToken(), adminToken: newToken() }));
     console.log(`Created ${file} (mode 600)
 
 Next steps:
@@ -98,8 +101,9 @@ Next steps:
        pamServers.*  -> PAM gateway host, your PAM user, identity (key fingerprint or title),
                         usernameTemplate matching your gateway's login format
        targets.*     -> target host + account as granted to you in PAM
+     (or start the server and use the admin UI: http://127.0.0.1:8765/admin)
   3. pamssh-mcp test <target>      # approve the 1Password prompt
-  4. pamssh-mcp serve`);
+  4. pamssh-mcp serve              # admin UI login token: pamssh-mcp token --admin`);
   },
 
   async keys(values) {
@@ -147,11 +151,21 @@ Next steps:
   },
 
   async serve(values) {
-    const { config, logger, manager } = makeRuntime(values);
+    const store = ConfigStore.load(resolveConfigPath(values.config));
+    const config = store.config;
+    const logger = createLogger(values['log-level'] || config.logLevel || 'info');
+    const manager = new SessionManager(config, { logger });
     const port = values.port !== undefined ? Number(values.port) : undefined;
-    const http = await startHttpServer({ config, manager, logger, host: values.host, port });
+    const http = await startHttpServer({
+      store, manager, logger, host: values.host, port, cliLogLevel: values['log-level'],
+    });
     const agent = resolveAgentSocket(config.agentSocket);
     logger.info(`pamssh-mcp ${VERSION} listening on ${http.url}`);
+    if (config.server.adminToken) {
+      logger.info(`admin UI: ${http.adminUrl} (login token: pamssh-mcp token --admin)`);
+    } else {
+      logger.info('admin UI disabled: no server.adminToken. Enable it with `pamssh-mcp token --admin --rotate`, then restart');
+    }
     logger.info(`config: ${config.file}`);
     logger.info(`SSH agent: ${agent.path} (${agent.source})`);
     logger.info(`targets: ${Object.keys(config.targets).join(', ') || '(none)'}`);
@@ -176,15 +190,20 @@ Next steps:
 
   async token(values) {
     const file = resolveConfigPath(values.config);
+    const key = values.admin ? 'adminToken' : 'authToken';
     if (values.rotate) {
       const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-      raw.server = { ...(raw.server || {}), authToken: newToken() };
+      raw.server = { ...(raw.server || {}), [key]: newToken() };
       writeJsonPrivate(file, raw);
-      console.error(`stored new token in ${file}; restart the server and update your agents`);
+      console.error(values.admin
+        ? `stored new admin token in ${file}; a running server picks it up via the admin UI \"reload\" or a restart`
+        : `stored new MCP token in ${file}; restart the server (or reload in the admin UI) and update your agents`);
     }
     const config = loadConfig(values.config);
-    if (!config.server.authToken) throw new ConfigError('server.authToken is not set (use --rotate)', file);
-    console.log(config.server.authToken);
+    if (!config.server[key]) {
+      throw new ConfigError(`server.${key} is not set (use ${values.admin ? '--admin ' : ''}--rotate)`, file);
+    }
+    console.log(config.server[key]);
   },
 };
 
