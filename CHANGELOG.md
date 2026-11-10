@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Tool guidance: `pam_close_session` description, server instructions and the `session` parameter now tell agents
+  to keep sessions open and reuse them, and to close one only when the user asks or it is necessary (target at
+  `maxSessions`, shell unusable). Idle sessions are still logged out by the server.
 - `pamssh-mcp serve start|stop|restart|status`: run the HTTP server in the background and control it. `stop` is
   graceful (SSH sessions are closed first) on every platform and falls back to killing the process after 20 s;
   `restart` reuses the options of the instance it replaced.

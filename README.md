@@ -127,7 +127,7 @@ claude mcp add pamssh -- npx -y pamssh-mcp stdio
 | `pam_exec` | 在目标上执行命令。参数：`target`、`command`、可选 `session`（默认 `default`）、`timeout_ms` |
 | `pam_open_session` | 提前登录（提前触发 1Password 授权或检查权限）|
 | `pam_list_sessions` | 列出当前持有的会话：状态、cwd、命令数、最后活动时间 |
-| `pam_close_session` | 登出并释放特权会话 |
+| `pam_close_session` | 登出并释放特权会话。默认不调用，任务结束也保留会话供后续复用（免重新登录和 1Password 授权，保留 cwd/环境）；空闲会话由服务按 `idleTimeoutMinutes` 自动登出。只在用户明确要求，或确有必要（会话数已满需要新会话、shell 卡死需要重新登录）时关闭 |
 
 **会话**：`pam_exec` 的 `session` 参数决定在哪个 shell 里执行。同名复用同一个 shell（`cd`、环境变量保留），新名字会建立一个独立的 PAM 登录：
 

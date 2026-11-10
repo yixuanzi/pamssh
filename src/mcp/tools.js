@@ -6,7 +6,8 @@ import { VERSION } from '../version.js';
 const SESSION_DESC = 'Session name (default "default"). The same name reuses the same shell; a new name opens an independent '
   + 'shell (a separate PAM login), e.g. to run long tasks in parallel or keep environments apart. Commands in one session '
   + 'run one at a time. Each target allows a limited number of active sessions (maxSessions in pam_list_targets); '
-  + 'close sessions you no longer need with pam_close_session.';
+  + 'prefer reusing an open session over opening a new name, and close one with pam_close_session only when the '
+  + 'limit blocks a session you need.';
 
 export const SERVER_INSTRUCTIONS = `\
 pamssh-mcp runs shell commands on servers reached through a PAM (privileged access management) SSH gateway.
@@ -17,7 +18,9 @@ Workflow:
 1. pam_list_targets to see which targets (id, account, host, description) are available.
 2. pam_exec with a target id and a POSIX shell command. The shell is persistent per (target, session):
    cd, exported variables and shell functions carry over between pam_exec calls.
-3. pam_close_session when finished with a target to release the privileged login.
+3. Keep sessions open and reuse them for later commands on the same target, also after a task is done. Do not call
+   pam_close_session unless the user asks for it or it is necessary (the target is at maxSessions and another
+   session is needed, or the shell is unusable). Idle sessions are logged out automatically.
 
 Rules for commands:
 - stdin is /dev/null and there is no human at the terminal: never start interactive programs (vim, less, top,
@@ -139,7 +142,12 @@ export function createMcpServer(manager, { logger } = {}) {
 
   server.registerTool('pam_close_session', {
     title: 'Close PAM session',
-    description: 'Log out of a target session and release the privileged PAM login.',
+    description: 'Log out of a target session and release the privileged PAM login. Do not call this by default, '
+      + 'not even when a task is finished: leave the session open so later pam_exec calls reuse the logged-in shell '
+      + '(no new login or 1Password prompt, cwd and environment kept). The server logs idle sessions out on its own '
+      + '(per-target idle timeout). Close a session only when the user explicitly asks for it, or when it is '
+      + 'necessary: the target is at maxSessions and another session is needed, or the shell is stuck or broken and '
+      + 'needs a fresh login. Closing discards the session\'s cwd and environment.',
     inputSchema: {
       target: z.string().describe('Target id'),
       session: z.string().optional().describe(SESSION_DESC),
