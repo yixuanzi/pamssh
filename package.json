@@ -1,6 +1,6 @@
 {
   "name": "pamssh-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server (Streamable HTTP / stdio) that keeps persistent SSH shell sessions to PAM-managed hosts, authenticating through the 1Password SSH agent.",
   "keywords": [
     "mcp",
