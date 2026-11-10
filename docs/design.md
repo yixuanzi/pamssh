@@ -138,6 +138,9 @@ flowchart LR
 | MCP 工具 | `src/mcp/tools.js` |
 | Streamable HTTP / stdio | `src/mcp/http-server.js`、`src/mcp/stdio-server.js` |
 | CLI | `src/cli.js` |
+| 唯一实例锁与控制通道 | `src/instance.js` |
+| `serve start/stop/restart/status/install/uninstall` | `src/serve-control.js` |
+| 用户级服务（launchd / 任务计划程序） | `src/service.js` |
 
 ---
 
@@ -249,6 +252,33 @@ flowchart LR
 ### 4.9 审计保留
 
 `audit.retentionDays`（默认 30 天）。`serve` / `stdio` 启动时清理一次，之后每 6 小时一次；在管理页面改小保留天数保存后立即清理。清理按每行的 `ts` 判断，读不出时间的行保留；只有确实删除了记录时才以 0600 原子重写文件。关闭审计后已有记录仍会按期限过期。
+
+### 4.10 唯一实例与后台服务
+
+**实例锁**：`serve` 启动时监听一个本地 IPC 端点——Unix 上是配置目录里的 `serve.sock`（0600；路径超过 socket 长度限制时退到 `$XDG_RUNTIME_DIR` / 临时目录），Windows 上是按用户名和配置目录命名的命名管道。监听成功即持有锁，失败则向端点查询 `status`：有应答说明已有实例，打印其 PID 和地址后退出；没有任何进程在监听说明是被强杀的实例留下的 socket 文件，删除后重试。
+
+没有用 PID 文件，原因有三：进程死亡后端点由操作系统回收，不存在 PID 被复用导致误判；同一个端点可以兼作控制通道；Windows 没有 SIGTERM，`process.kill` 等于强杀，优雅停止只能通过通道请求。
+
+控制通道协议是一行 JSON 请求、一行 JSON 应答：`status` 返回 PID、版本、监听地址、配置文件、启动参数；`stop` 应答后触发与 SIGTERM 相同的关闭流程（关闭 SSH 会话 → 关闭 HTTP → 退出码 0）。Unix 上 socket 文件权限为 0600，只有本用户能连接；通道能做的只有查询和停止，不涉及令牌和会话。
+
+锁的范围是配置目录（`configDir()`），所以默认每个用户一个实例；`PAMSSH_MCP_HOME` 不同则互不影响，测试也借此隔离。`stdio` 模式由 agent 按需拉起，不加锁。
+
+**后台启动**：`serve start` 以 detached 方式再启动一个 `serve`，stdout/stderr 追加到日志文件，然后轮询 `status`，直到 HTTP 开始监听才报告成功；子进程提前退出则打印它这次写入的日志。`serve stop` 发送 `stop` 后等待端点消失，20 秒超时后强制结束。`serve restart` 在未指定参数时沿用旧实例上报的启动参数。
+
+**用户级服务**：必须运行在用户登录会话内才能访问 1Password agent，所以不做系统级服务。
+
+| | macOS | Windows |
+| --- | --- | --- |
+| 机制 | `~/Library/LaunchAgents` 下的 LaunchAgent，`launchctl bootstrap gui/<uid>` | 任务计划程序任务，XML 注册，触发器为当前用户（SID）登录 |
+| 进程 | launchd 直接运行前台 `serve` | 任务执行 `serve start --no-service`，由它拉起后台实例后退出（任务直接运行控制台程序会留下一个窗口）|
+| 崩溃恢复 | `KeepAlive.SuccessfulExit=false`：异常退出重启，正常停止不重启 | 无 |
+| `serve start` | 已加载则 `kickstart`，否则 `bootstrap` | `schtasks /Run` |
+
+launchd 下有两个配合点：`serve stop` 走控制通道让进程以 0 退出，所以不会被 KeepAlive 拉起，任务保持已加载，下次 `serve start` 或登录时再启动；服务进程带有 `PAMSSH_MCP_SERVICE` 环境变量，发现已有实例时以 0 退出，避免 launchd 每 10 秒重试一次。强制结束前会先 `bootout`，否则被杀的进程会被立刻重启。
+
+Windows 任务用 XML 而不是 `schtasks /SC ONLOGON`：后者注册的是“任意用户登录”，需要管理员权限；限定为当前用户的登录触发器普通用户即可注册。
+
+服务名随配置目录变化：默认目录是 `io.github.pamssh-mcp` / `pamssh-mcp`，其它目录追加目录哈希，避免多套配置互相覆盖。
 
 ---
 

@@ -82,8 +82,14 @@ pamssh-mcp test web-01
 **5. 启动服务**
 
 ```bash
-pamssh-mcp serve
+pamssh-mcp serve          # 前台运行，Ctrl-C 退出
 ```
+
+```bash
+pamssh-mcp serve start    # 或者放到后台运行；开机自启见“作为后台服务运行”
+```
+
+同一用户同时只能运行一个服务实例：已有实例时，再次启动会提示它的 PID 和地址后退出。
 
 **6. 接入 agent**
 
@@ -219,15 +225,35 @@ pamssh-mcp token --admin --rotate   # 生成 / 更换管理令牌（旧配置没
 
 令牌在页面里默认隐藏，需要时点“显示”（会记一条日志）。管理接口也可以用 `Authorization: Bearer <管理令牌>` 从脚本调用。
 
-## 作为后台服务运行（macOS）
+## 作为后台服务运行
 
-参考 [examples/launchd/io.github.pamssh-mcp.plist](examples/launchd/io.github.pamssh-mcp.plist)，放到 `~/Library/LaunchAgents/` 后：
+| 命令 | 作用 |
+| --- | --- |
+| `pamssh-mcp serve` | 前台运行 |
+| `pamssh-mcp serve start` | 后台启动（已安装用户服务时通过服务管理器启动），等服务就绪后打印 PID、地址和日志路径 |
+| `pamssh-mcp serve stop` | 停止正在运行的实例：先关闭 SSH 会话（释放 PAM 登录）再退出；20 秒内没退出则强制结束 |
+| `pamssh-mcp serve restart` | 停止后重新启动，沿用上次的 `--config` / `--host` / `--port` / `--log-level` |
+| `pamssh-mcp serve status` | 是否在运行（未运行时退出码为 3）、是否已安装用户服务 |
+| `pamssh-mcp serve install` | 安装并启动用户级服务，登录后自动运行；可带 `--config` / `--host` / `--port` / `--log-level`，重复执行即更新 |
+| `pamssh-mcp serve uninstall` | 停止服务并移除用户级服务 |
 
-```bash
-launchctl load ~/Library/LaunchAgents/io.github.pamssh-mcp.plist
-```
+**唯一实例**：同一用户（同一个配置目录）同时只能运行一个 `serve`。已有实例时，`serve` 提示后以退出码 1 退出，`serve start` 提示后以 0 退出；`stdio` 模式不受限制。`stop` / `restart` / `status` 对任何方式启动的实例都有效（前台、后台、服务）。
 
-必须用 LaunchAgent（用户会话内）而不是 LaunchDaemon，否则访问不到 1Password，也无法弹出授权。
+**用户级服务**：不需要管理员权限，运行在你的登录会话里，这样才能访问 1Password SSH agent 并弹出授权（系统级服务如 LaunchDaemon、Windows 服务做不到）。
+
+| 平台 | 实现 | 位置 |
+| --- | --- | --- |
+| macOS | LaunchAgent：登录时启动，崩溃后自动重启，`serve stop` 正常停止后不会被拉起 | `~/Library/LaunchAgents/io.github.pamssh-mcp.plist` |
+| Windows | 任务计划程序：当前用户登录时执行 `serve start`，在后台无窗口运行 | 任务 `pamssh-mcp` |
+
+- 后台实例的日志：macOS `~/Library/Logs/pamssh-mcp.log`，Windows `%LOCALAPPDATA%\pamssh-mcp\pamssh-mcp.log`，Linux `~/.local/state/pamssh-mcp/pamssh-mcp.log`。
+- 服务里记录的是安装时 `node` 和 `pamssh-mcp` 的绝对路径：升级 Node（例如 nvm 切换版本）或重装到别的位置后，重新执行一次 `pamssh-mcp serve install`。
+- 服务使用配置文件里的令牌，不会带上当前终端里的 `PAMSSH_MCP_TOKEN` / `PAMSSH_ADMIN_TOKEN`。
+- 安装时已有手工启动的实例在运行，它会保持不变；执行 `pamssh-mcp serve restart` 后改由服务运行。
+- Linux 没有内置安装命令，`serve start` / `stop` / `restart` 可用；需要自启时可以在 systemd 用户单元里执行 `pamssh-mcp serve`。
+- 设置了 `PAMSSH_MCP_HOME`（或 `XDG_CONFIG_HOME`）时，实例锁、服务名都按该目录区分，可以为另一套配置单独运行和安装一个实例。
+
+手工配置 LaunchAgent 可参考 [examples/launchd/io.github.pamssh-mcp.plist](examples/launchd/io.github.pamssh-mcp.plist)。
 
 ## 安全须知
 

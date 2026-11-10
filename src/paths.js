@@ -24,6 +24,22 @@ export function defaultConfigPath() {
   return path.join(configDir(), 'config.json');
 }
 
+/** Log file of a background / service `serve` (the foreground server logs to stderr). */
+export function logFile() {
+  if (process.env.PAMSSH_MCP_HOME) return path.join(configDir(), 'pamssh-mcp.log');
+  switch (process.platform) {
+    case 'darwin':
+      return path.join(os.homedir(), 'Library', 'Logs', 'pamssh-mcp.log');
+    case 'win32':
+      return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
+        'pamssh-mcp', 'pamssh-mcp.log');
+    default:
+      return path.join(process.env.XDG_STATE_HOME
+        ? expandPath(process.env.XDG_STATE_HOME)
+        : path.join(os.homedir(), '.local', 'state'), 'pamssh-mcp', 'pamssh-mcp.log');
+  }
+}
+
 /** Where the 1Password desktop app exposes its SSH agent on each platform. */
 export function onePasswordAgentSocket() {
   switch (process.platform) {

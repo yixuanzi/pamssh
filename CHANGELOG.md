@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `pamssh-mcp serve start|stop|restart|status`: run the HTTP server in the background and control it. `stop` is
+  graceful (SSH sessions are closed first) on every platform and falls back to killing the process after 20 s;
+  `restart` reuses the options of the instance it replaced.
+- `pamssh-mcp serve install|uninstall`: user-level service that starts at login, no admin rights. macOS: LaunchAgent
+  (restarted after a crash, stays down after `serve stop`); Windows: Task Scheduler task with a logon trigger for the
+  current user. Once installed, `serve start|restart` go through the service.
+- Single instance: only one `serve` may run per user (per config directory). A second one prints the pid and URL of
+  the running instance and exits (code 1; `serve start` exits 0). `stdio` mode is not limited.
 - Admin web UI at `/admin` on `pamssh-mcp serve`, behind a separate `server.adminToken` (must differ from the MCP
   token): server-side sessions (HttpOnly, SameSite=Strict), CSRF checks, login lockout, strict CSP.
 - Manage every config field in forms generated from field metadata with help text, defaults, examples, units,

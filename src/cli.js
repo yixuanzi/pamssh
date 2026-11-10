@@ -10,6 +10,8 @@ import { SessionManager } from './session-manager.js';
 import { ConfigStore } from './config-store.js';
 import { startHttpServer } from './mcp/http-server.js';
 import { startStdioServer } from './mcp/stdio-server.js';
+import { AlreadyRunningError, acquireInstanceLock } from './instance.js';
+import { serveActions, serveOptions } from './serve-control.js';
 import { VERSION } from './version.js';
 
 const HELP = `pamssh-mcp ${VERSION}
@@ -23,14 +25,22 @@ Commands:
   keys                 List keys in the SSH agent (1Password) with fingerprints
   targets              List configured targets and their PAM login strings
   test <target>        Log in to a target and run a check command
-  serve                Start the Streamable HTTP MCP server and the admin UI (/admin)
+  serve                Run the Streamable HTTP MCP server and the admin UI (/admin) in the
+                       foreground. Only one instance runs at a time; manage it with:
+    serve start          start it in the background (through the user service if installed)
+    serve stop           stop the running instance (closes its SSH sessions first)
+    serve restart        stop, then start again with the same options
+    serve status         show whether it is running, and whether the service is installed
+    serve install        install and start a user-level service that starts at login
+                         (macOS: LaunchAgent, Windows: Task Scheduler; no admin rights)
+    serve uninstall      stop it and remove the user-level service
   stdio                Run the MCP server over stdio (spawned by an agent)
   token                Print the MCP access token (--admin: admin UI token; --rotate: replace it)
 
 Options:
   -c, --config <file>  Config file (default: $PAMSSH_MCP_CONFIG or ~/.config/pamssh-mcp/config.json)
-      --host <addr>    serve: bind address (default from config, 127.0.0.1)
-  -p, --port <n>       serve: port (default from config, 8765)
+      --host <addr>    serve [start|restart|install]: bind address (default from config, 127.0.0.1)
+  -p, --port <n>       serve [start|restart|install]: port (default from config, 8765)
       --command <cmd>  test: command to run (default: id; hostname; pwd)
       --session <name> test: session name
       --socket <path>  keys: SSH agent socket to query
@@ -49,6 +59,7 @@ const OPTIONS = {
   command: { type: 'string' },
   session: { type: 'string' },
   socket: { type: 'string' },
+  'no-service': { type: 'boolean' }, // serve start: spawn directly even if a service is installed
   rotate: { type: 'boolean' },
   admin: { type: 'boolean' },
   force: { type: 'boolean', short: 'f' },
@@ -150,7 +161,29 @@ Next steps:
     }
   },
 
-  async serve(values) {
+  async serve(values, positionals) {
+    const [action, ...extra] = positionals;
+    if (action) {
+      const run = Object.hasOwn(serveActions, action) && !extra.length ? serveActions[action] : null;
+      if (!run) throw new Error(`usage: pamssh-mcp serve [${Object.keys(serveActions).join('|')}]`);
+      return run(values);
+    }
+
+    let lock;
+    try {
+      lock = await acquireInstanceLock({
+        version: VERSION,
+        foreground: process.stderr.isTTY === true,
+        service: process.env.PAMSSH_MCP_SERVICE || null,
+        options: serveOptions(values),
+      });
+    } catch (err) {
+      if (!(err instanceof AlreadyRunningError)) throw err;
+      console.error(`${err.message}. Only one instance may run at a time: use it, or stop it with \`pamssh-mcp serve stop\`.`);
+      // Started by a service manager: exit cleanly so it does not keep retrying.
+      process.exitCode = process.env.PAMSSH_MCP_SERVICE ? 0 : 1;
+      return undefined;
+    }
     const store = ConfigStore.load(resolveConfigPath(values.config));
     const config = store.config;
     const logger = createLogger(values['log-level'] || config.logLevel || 'info');
@@ -161,7 +194,8 @@ Next steps:
       store, manager, logger, host: values.host, port, cliLogLevel: values['log-level'],
     });
     const agent = resolveAgentSocket(config.agentSocket);
-    logger.info(`pamssh-mcp ${VERSION} listening on ${http.url}`);
+    lock.update({ url: http.url, adminUrl: config.server.adminToken ? http.adminUrl : null, config: config.file });
+    logger.info(`pamssh-mcp ${VERSION} listening on ${http.url} (pid ${process.pid})`);
     if (config.server.adminToken) {
       logger.info(`admin UI: ${http.adminUrl} (login token: pamssh-mcp token --admin)`);
     } else {
@@ -171,11 +205,13 @@ Next steps:
     logger.info(`SSH agent: ${agent.path} (${agent.source})`);
     logger.info(`targets: ${Object.keys(config.targets).join(', ') || '(none)'}`);
     logger.info(`connect an agent, e.g.: claude mcp add --transport http pamssh ${http.url} --header "Authorization: Bearer $(pamssh-mcp token)"`);
-    onShutdown(async (sig) => {
+    const shutdown = onShutdown(async (sig) => {
       logger.info(`${sig}: closing SSH sessions`);
       await manager.closeAll();
       await http.close();
     });
+    lock.onStop(() => shutdown('stop requested'));
+    return undefined;
   },
 
   async stdio(values) {

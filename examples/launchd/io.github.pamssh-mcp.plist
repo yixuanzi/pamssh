@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   macOS LaunchAgent for pamssh-mcp.
+  `pamssh-mcp serve install` generates and loads an equivalent file for you
+  (and `pamssh-mcp serve uninstall` removes it); use this one only to set it up by hand:
   1. Replace /Users/YOU and the pamssh-mcp path (`which pamssh-mcp`).
   2. cp io.github.pamssh-mcp.plist ~/Library/LaunchAgents/
   3. launchctl load ~/Library/LaunchAgents/io.github.pamssh-mcp.plist
